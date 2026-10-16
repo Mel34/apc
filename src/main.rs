@@ -721,6 +721,22 @@ impl App {
         let _guard = RootGuard::acquire()?;
         check_and_clean_stale_lock();
 
+        // Purge stale archives from global cache to avoid checksum collisions
+        let pkg_cache = Path::new("/var/cache/pacman/pkg");
+        if let Ok(entries) = fs::read_dir(pkg_cache) {
+            let prefixes: Vec<String> = targets.iter().map(|t| format!("{t}-")).collect();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
+                        && prefixes.iter().any(|p| name.starts_with(p))
+                    {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+
         let op_name = if reinstall { "Reinstalling Packages" } else { "Installing Packages" };
         let target_desc = targets.join(", ");
 
