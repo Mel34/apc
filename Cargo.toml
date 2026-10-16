@@ -1,0 +1,12 @@
+[package]
+name = "apc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alpm = "5.0"
+pacmanconf = "3.0"
+ratatui = "0.28"
+crossterm = "0.28"
+anyhow = "1.0"
+libc = "0.2"
