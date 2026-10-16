@@ -1045,9 +1045,9 @@ fn draw_pane(
     app: &App,
 ) {
     let border_style = if is_active {
-        Style::default().fg(NC_CYAN)
-    } else {
         Style::default().fg(NC_WHITE)
+    } else {
+        Style::default().fg(NC_CYAN)
     };
 
     let title_line = Line::from(vec![
