@@ -162,7 +162,6 @@ enum DialogAction {
     Delete(Vec<String>),
     Install(Vec<String>),
     Reinstall(Vec<String>),
-    SysUpgrade,
     Downgrade {
         #[allow(dead_code)]
         pkg_name: String,
@@ -1505,11 +1504,6 @@ fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
             Color::Rgb(0, 100, 0),
             format!("Total package size: {:.2} MiB", size_mib),
         ),
-        DialogAction::SysUpgrade => (
-            "You are about to upgrade the system:",
-            NC_BLUE,
-            format!("Total download size: {:.2} MiB", size_mib),
-        ),
         DialogAction::Downgrade { ref target_version, .. } => (
             "Downgrade package:",
             Color::Rgb(0, 100, 0),
@@ -1530,11 +1524,7 @@ fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
             diag.cascade.join(", ")
         };
         lines.push(Line::from(""));
-        let sub_title = if matches!(diag.action, DialogAction::SysUpgrade) {
-            "New package dependencies to be installed:"
-        } else {
-            "Dependent packages that will also be removed:"
-        };
+        let sub_title = "Dependent packages that will also be removed:";
         lines.push(Line::from(Span::styled(sub_title, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
         lines.push(Line::from(Span::styled(format!("  • {}", cascade_preview), Style::default().fg(NC_BLACK))));
     }
@@ -1846,16 +1836,6 @@ fn main() -> Result<()> {
                                         }
                                     }
                                 }
-                                DialogAction::SysUpgrade => {
-                                    if diag.selected_button == 0 {
-                                        if let Err(e) = app.alpm_commit_sysupgrade(&mut terminal) {
-                                            app.modal = Some(Modal::Message(format!("Error: {e}")));
-                                        }
-                                    } else {
-                                        let _ = app.alpm.trans_release();
-                                        app.updates_view = None;
-                                    }
-                                }
                                 DialogAction::Downgrade { path, .. } => {
                                     if diag.selected_button == 0 {
                                         // Downgrade & Lock
@@ -1871,12 +1851,7 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
-                        KeyCode::Esc => {
-                            if matches!(diag.action, DialogAction::SysUpgrade) {
-                                let _ = app.alpm.trans_release();
-                                app.updates_view = None;
-                            }
-                        }
+                        KeyCode::Esc => {}
                         _ => {
                             app.modal = Some(modal);
                         }
