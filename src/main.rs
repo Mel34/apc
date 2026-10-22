@@ -210,6 +210,7 @@ struct App {
     info_mode: bool,
     locked_pkgs: HashSet<String>,
     updates_view: Option<SysUpdateInfo>,
+    upgrade_selected_button: usize,
     downgrade_view: Option<DowngradeView>,
     cache_dirs: Vec<String>,
     modal: Option<Modal>,
@@ -336,6 +337,7 @@ impl App {
             info_mode: false,
             locked_pkgs,
             updates_view: None,
+            upgrade_selected_button: 0,
             downgrade_view: None,
             cache_dirs,
             modal: None,
@@ -929,24 +931,12 @@ impl App {
             return Ok(());
         }
 
-        let update_names: Vec<String> = updates.iter().map(|u| u.name.clone()).collect();
-        let dep_names: Vec<String> = new_deps.iter().map(|d| d.name.clone()).collect();
-
         self.updates_view = Some(SysUpdateInfo {
             updates,
             new_deps,
             total_download_size,
         });
-
-        self.modal = Some(Modal::Confirm(ConfirmationDialog {
-            title: "System Upgrade".to_string(),
-            packages: update_names,
-            cascade: dep_names,
-            total_size: total_download_size,
-            selected_button: 0,
-            button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-            action: DialogAction::SysUpgrade,
-        }));
+        self.upgrade_selected_button = 0;
 
         Ok(())
     }
@@ -1353,6 +1343,25 @@ fn draw_pane(
 
 fn draw_bottom_bar(f: &mut Frame, area: Rect, active: ActivePane, app: &App) {
     let is_narrow = area.width < 114;
+
+    if app.updates_view.is_some() {
+        let choices = [("Proceed", 0), ("Cancel", 1)];
+        let mut spans = Vec::new();
+        for (label, index) in choices {
+            let style = if app.upgrade_selected_button == index {
+                Style::default().fg(NC_BLACK).bg(NC_CYAN).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(NC_BLACK).bg(NC_GRAY)
+            };
+            spans.push(Span::styled(format!(" {label} "), style));
+            spans.push(Span::raw(" "));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(NC_GRAY)),
+            area,
+        );
+        return;
+    }
 
     if app.downgrade_view.is_some() {
         let keys = vec![
@@ -1772,6 +1781,30 @@ fn main() -> Result<()> {
 
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            // System upgrade confirmation uses the status bar instead of a modal.
+            if app.updates_view.is_some() {
+                match key.code {
+                    KeyCode::Left => app.upgrade_selected_button = 0,
+                    KeyCode::Right => app.upgrade_selected_button = 1,
+                    KeyCode::Enter => {
+                        if app.upgrade_selected_button == 0 {
+                            if let Err(e) = app.alpm_commit_sysupgrade(&mut terminal) {
+                                app.modal = Some(Modal::Message(format!("Error: {e}")));
+                            }
+                        } else {
+                            let _ = app.alpm.trans_release();
+                            app.updates_view = None;
+                        }
+                    }
+                    KeyCode::Esc => {
+                        let _ = app.alpm.trans_release();
+                        app.updates_view = None;
+                    }
+                    _ => {}
+                }
                 continue;
             }
 
