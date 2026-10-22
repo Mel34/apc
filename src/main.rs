@@ -319,7 +319,6 @@ impl App {
                     unsafe {
                         let t = &mut *ptr;
                         let _ = t.draw(|f| {
-                            f.render_widget(Block::default().style(Style::default().bg(NC_BLUE)), f.area());
                             draw_progress_dialog(f, &prog);
                         });
                     }
