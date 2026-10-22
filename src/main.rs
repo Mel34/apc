@@ -1285,7 +1285,7 @@ fn draw_pane(
     }
 
     // Special System Updates Info Pane (Replaces Repository Packages)
-    if !is_left_pane {
+    if !is_left_pane || app.system_upgrade_in_progress {
         if let Some(ref update_info) = app.updates_view {
             let upd_block = Block::default()
                 .borders(Borders::ALL)
