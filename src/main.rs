@@ -41,6 +41,7 @@ static LOG_TO_STDOUT: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static ACTIVE_TERM: Cell<*mut Terminal<CrosstermBackend<std::fs::File>>> = Cell::new(std::ptr::null_mut());
+    static BACKGROUND_BUFFER: std::cell::RefCell<Option<ratatui::buffer::Buffer>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone)]
