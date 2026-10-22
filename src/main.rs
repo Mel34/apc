@@ -187,6 +187,25 @@ struct ProgressState {
     percent: u16,
 }
 
+struct PackageProgressItem {
+    name: String,
+    percent: u16,
+}
+
+#[derive(Default)]
+struct PackageProgressState {
+    packages: Vec<PackageProgressItem>,
+    active_package: Option<String>,
+    overall_percent: u16,
+}
+
+static PACKAGE_PROGRESS: std::sync::Mutex<PackageProgressState> =
+    std::sync::Mutex::new(PackageProgressState {
+        packages: Vec::new(),
+        active_package: None,
+        overall_percent: 0,
+    });
+
 enum Modal {
     Confirm(ConfirmationDialog),
     Help,
