@@ -233,6 +233,7 @@ struct App {
     cache_dirs: Vec<String>,
     modal: Option<Modal>,
     progress: Option<ProgressState>,
+    system_upgrade_in_progress: bool,
     should_quit: bool,
 }
 
@@ -375,6 +376,7 @@ impl App {
             cache_dirs,
             modal: None,
             progress: None,
+            system_upgrade_in_progress: false,
             should_quit: false,
         };
 
@@ -1352,6 +1354,15 @@ fn draw_pane(
 }
 
 fn draw_bottom_bar(f: &mut Frame, area: Rect, active: ActivePane, app: &App) {
+    if app.system_upgrade_in_progress {
+        f.render_widget(
+            Paragraph::new(" Please wait. System upgrade in progress. ")
+                .style(Style::default().fg(NC_BLACK).bg(NC_GRAY)),
+            area,
+        );
+        return;
+    }
+
     let is_narrow = area.width < 114;
 
     if app.updates_view.is_some() {
