@@ -959,11 +959,15 @@ impl App {
     ) -> Result<()> {
         let _guard = RootGuard::acquire()?;
 
+        self.system_upgrade_in_progress = true;
+        terminal.draw(|f| draw_ui(f, self))?;
+
         let commit_result = Self::commit_in_tui(terminal, "System Upgrade", || {
             self.alpm
                 .trans_commit()
                 .map_err(|e| anyhow::anyhow!("System upgrade commit failed: {e:?}"))
         });
+        self.system_upgrade_in_progress = false;
 
         if let Err(e) = commit_result {
             let _ = self.alpm.trans_release();
