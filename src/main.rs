@@ -207,6 +207,89 @@ static PACKAGE_PROGRESS: std::sync::Mutex<PackageProgressState> =
         overall_percent: 0,
     });
 
+fn redraw_transaction_progress() {
+    let background = BACKGROUND_BUFFER.with(|buffer| buffer.borrow().clone());
+    let Some(background) = background else {
+        return;
+    };
+
+    ACTIVE_TERM.with(|term| {
+        let terminal_ptr = term.get();
+        if terminal_ptr.is_null() {
+            return;
+        }
+
+        let state = PACKAGE_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        unsafe {
+            let _ = (*terminal_ptr).draw(|frame| {
+                *frame.buffer_mut() = background.clone();
+
+                let area = frame.area();
+                let right_area = Rect {
+                    x: area.x + area.width / 2,
+                    y: area.y,
+                    width: area.width - area.width / 2,
+                    height: area.height.saturating_sub(1),
+                };
+
+                let block = Block::default()
+                    .title("Transaction Progress")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(NC_CYAN));
+                let inner = block.inner(right_area);
+                frame.render_widget(block, right_area);
+
+                if inner.width == 0 || inner.height == 0 {
+                    return;
+                }
+
+                frame.render_widget(
+                    Paragraph::new(format!("Overall: {}%", state.overall_percent))
+                        .style(Style::default().fg(NC_YELLOW)),
+                    Rect {
+                        x: inner.x,
+                        y: inner.y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
+
+                for (index, item) in state.packages.iter().enumerate() {
+                    let y = inner.y + 1 + index as u16;
+                    if y >= inner.y + inner.height {
+                        break;
+                    }
+
+                    let active = state.active_package.as_deref() == Some(item.name.as_str());
+                    let color = if active {
+                        NC_YELLOW
+                    } else if item.percent == 100 {
+                        NC_WHITE
+                    } else {
+                        NC_GRAY
+                    };
+
+                    frame.render_widget(
+                        ratatui::widgets::Gauge::default()
+                            .percent(item.percent)
+                            .label(format!("{} {}%", item.name, item.percent))
+                            .gauge_style(Style::default().fg(color)),
+                        Rect {
+                            x: inner.x,
+                            y,
+                            width: inner.width,
+                            height: 1,
+                        },
+                    );
+                }
+            });
+        }
+    });
+}
+
 enum Modal {
     Confirm(ConfirmationDialog),
     Help,
@@ -308,6 +391,7 @@ impl App {
                 state.overall_percent = overall;
             }
 
+            redraw_transaction_progress();
         });
 
         // Register ALPM log callback
