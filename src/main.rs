@@ -668,9 +668,6 @@ impl App {
             }
         }
 
-        BACKGROUND_BUFFER.with(|buffer| {
-            *buffer.borrow_mut() = Some(terminal.current_buffer_mut().clone());
-        });
         ACTIVE_TERM.with(|t| t.set(terminal as *mut _));
 
 
@@ -1048,7 +1045,12 @@ impl App {
         let _guard = RootGuard::acquire()?;
 
         self.system_upgrade_in_progress = true;
-        terminal.draw(|f| draw_ui(f, self))?;
+        terminal.draw(|f| {
+            draw_ui(f, self);
+            BACKGROUND_BUFFER.with(|buffer| {
+                *buffer.borrow_mut() = Some(f.buffer_mut().clone());
+            });
+        })?;
 
         let commit_result = Self::commit_in_tui(terminal, "System Upgrade", || {
             self.alpm
