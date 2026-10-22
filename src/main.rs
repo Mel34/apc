@@ -584,6 +584,9 @@ impl App {
             }
         }
 
+        BACKGROUND_BUFFER.with(|buffer| {
+            *buffer.borrow_mut() = Some(terminal.current_buffer_mut().clone());
+        });
         ACTIVE_TERM.with(|t| t.set(terminal as *mut _));
 
 
