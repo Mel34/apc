@@ -306,24 +306,6 @@ impl App {
                 state.overall_percent = overall;
             }
 
-            let prog = ProgressState {
-                title: "Processing Packages".to_string(),
-                target: format!("{pkgname} ({current} of {howmany})"),
-                step: "Extracting and installing files...".to_string(),
-                percent: overall,
-            };
-
-            ACTIVE_TERM.with(|term| {
-                let ptr = term.get();
-                if !ptr.is_null() {
-                    unsafe {
-                        let t = &mut *ptr;
-                        let _ = t.draw(|f| {
-                            draw_progress_dialog(f, &prog);
-                        });
-                    }
-                }
-            });
         });
 
         // Register ALPM log callback
@@ -582,7 +564,7 @@ impl App {
     // --- Live In-TUI Commit Engine ---
     fn commit_in_tui<F, R>(
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
-        title: &str,
+        _title: &str,
         action: F,
     ) -> Result<R>
     where
@@ -601,16 +583,6 @@ impl App {
 
         ACTIVE_TERM.with(|t| t.set(terminal as *mut _));
 
-        let initial_prog = ProgressState {
-            title: title.to_string(),
-            target: "Preparing packages...".to_string(),
-            step: "Starting transaction...".to_string(),
-            percent: 0,
-        };
-        let _ = terminal.draw(|f| {
-            f.render_widget(Block::default().style(Style::default().bg(NC_BLUE)), f.area());
-            draw_progress_dialog(f, &initial_prog);
-        });
 
         let result = action();
 
@@ -625,19 +597,6 @@ impl App {
             }
         }
 
-        if result.is_ok() {
-            let done_prog = ProgressState {
-                title: title.to_string(),
-                target: "All packages processed".to_string(),
-                step: "Complete!".to_string(),
-                percent: 100,
-            };
-            let _ = terminal.draw(|f| {
-                f.render_widget(Block::default().style(Style::default().bg(NC_BLUE)), f.area());
-                draw_progress_dialog(f, &done_prog);
-            });
-            thread::sleep(Duration::from_millis(350));
-        }
 
         result
     }
