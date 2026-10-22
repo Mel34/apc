@@ -264,13 +264,47 @@ impl App {
             }
         }
 
-        // Live In-TUI progress callback: redrawn directly on every package step
-        alpm.set_progress_cb((), move |_progress, pkgname, percent, howmany, current, _| {
+        // Live In-TUI progress callback: record package progress and redraw the current dialog
+        alpm.set_progress_cb((), move |progress, pkgname, percent, howmany, current, _| {
             let overall = if howmany > 0 {
                 ((current.saturating_sub(1) * 100 + percent.max(0) as usize) / howmany).min(100) as u16
             } else {
                 percent.max(0).min(100) as u16
             };
+
+            if matches!(
+                progress,
+                alpm::Progress::AddStart
+                    | alpm::Progress::UpgradeStart
+                    | alpm::Progress::DowngradeStart
+                    | alpm::Progress::ReinstallStart
+                    | alpm::Progress::RemoveStart
+            ) {
+                let mut state = PACKAGE_PROGRESS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+                if state.active_package.as_deref() != Some(pkgname) {
+                    if let Some(previous) = state.active_package.clone() {
+                        if let Some(item) = state.packages.iter_mut().find(|item| item.name == previous) {
+                            item.percent = 100;
+                        }
+                    }
+
+                    if !state.packages.iter().any(|item| item.name == pkgname) {
+                        state.packages.push(PackageProgressItem {
+                            name: pkgname.to_string(),
+                            percent: 0,
+                        });
+                    }
+                    state.active_package = Some(pkgname.to_string());
+                }
+
+                if let Some(item) = state.packages.iter_mut().find(|item| item.name == pkgname) {
+                    item.percent = percent.max(0).min(100) as u16;
+                }
+                state.overall_percent = overall;
+            }
 
             let prog = ProgressState {
                 title: "Processing Packages".to_string(),
