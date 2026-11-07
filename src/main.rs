@@ -2831,20 +2831,7 @@ fn main() -> Result<()> {
                             vec![]
                         };
 
-                        if !targets.is_empty() {
-                            let total_size = app.total_download_size_for_packages(&targets);
-
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Install".to_string(),
-                                packages: targets.clone(),
-                                additional_removals: Vec::new(),
-                                hold_packages: Vec::new(),
-                                total_size,
-                                selected_button: 1,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Install(targets),
-                            }));
-                        }
+                        app.open_install_confirmation(targets, false);
                     }
                 }
                 KeyCode::F(6) => {
