@@ -512,53 +512,67 @@ fn expand_include_pattern(pattern: &str, config_path: &Path) -> Vec<std::path::P
     candidates
 }
 
-fn config_includes_file(
-    config_path: &Path,
-    target_path: &Path,
-    visited: &mut HashSet<std::path::PathBuf>,
-) -> bool {
-    let config_path = fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
-    if !visited.insert(config_path.clone()) {
-        return false;
-    }
-
-    let Ok(content) = fs::read_to_string(&config_path) else {
-        return false;
-    };
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+fn config_includes_file(config_path: &Path, target_path: &Path) -> bool {
+    fn visit(
+        config_path: &Path,
+        target_path: &Path,
+        section: &mut Option<String>,
+        visited: &mut HashSet<(std::path::PathBuf, Option<String>)>,
+    ) -> bool {
+        let config_path =
+            fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+        if !visited.insert((config_path.clone(), section.clone())) {
+            return false;
         }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
+
+        let Ok(content) = fs::read_to_string(&config_path) else {
+            return false;
         };
-        if !key.trim().eq_ignore_ascii_case("Include") {
-            continue;
-        }
 
-        let pattern = value
-            .split('#')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'');
-        for included_path in expand_include_pattern(pattern, &config_path) {
-            let resolved = fs::canonicalize(&included_path)
-                .unwrap_or_else(|_| included_path.clone());
-            if resolved == target_path {
-                return true;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
             }
-            if included_path.is_file()
-                && config_includes_file(&included_path, target_path, visited)
+
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                *section = Some(trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase());
+                continue;
+            }
+
+            let Some((key, value)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if !key.trim().eq_ignore_ascii_case("Include")
+                || section.as_deref() != Some("options")
             {
-                return true;
+                continue;
+            }
+
+            // pacman.conf only supports whole-line comments, so preserve '#' in paths.
+            let pattern = value.trim().trim_matches('"').trim_matches('\'');
+            for included_path in expand_include_pattern(pattern, &config_path) {
+                let resolved = fs::canonicalize(&included_path)
+                    .unwrap_or_else(|_| included_path.clone());
+                if resolved == target_path {
+                    return true;
+                }
+                if included_path.is_file()
+                    && visit(&included_path, target_path, section, visited)
+                {
+                    return true;
+                }
             }
         }
+        false
     }
-    false
+
+    visit(
+        config_path,
+        target_path,
+        &mut None,
+        &mut HashSet::new(),
+    )
 }
 
 fn pacman_config_includes_managed_ignore_file() -> bool {
@@ -567,7 +581,7 @@ fn pacman_config_includes_managed_ignore_file() -> bool {
     let Ok(target_path) = fs::canonicalize(target_path) else {
         return false;
     };
-    config_includes_file(config_path, &target_path, &mut HashSet::new())
+    config_includes_file(config_path, &target_path)
 }
 
 fn parse_external_ignore_packages(
@@ -3334,7 +3348,6 @@ mod tests {
         assert!(config_includes_file(
             &root.join("pacman.conf"),
             &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
-            &mut HashSet::new(),
         ));
 
         fs::write(
@@ -3346,7 +3359,31 @@ mod tests {
         assert!(!config_includes_file(
             &root.join("pacman.conf"),
             &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
-            &mut HashSet::new(),
+        ));
+
+        fs::write(
+            root.join("pacman.conf"),
+            "[core]\nInclude = IgnorePkg\n",
+        )
+        .unwrap();
+        assert!(!config_includes_file(
+            &root.join("pacman.conf"),
+            &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
+        ));
+
+        fs::write(
+            root.join("pacman.conf"),
+            "[options]\nInclude = conf.d/*.conf\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("conf.d/managed.conf"),
+            "[core]\nInclude = ../IgnorePkg\n",
+        )
+        .unwrap();
+        assert!(!config_includes_file(
+            &root.join("pacman.conf"),
+            &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
         ));
 
         fs::remove_dir_all(root).unwrap();
