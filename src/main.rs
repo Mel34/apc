@@ -476,6 +476,13 @@ impl App {
         alpm.set_logfile(pacconf.log_file.as_str())?;
         alpm.set_check_space(pacconf.check_space);
         alpm.set_use_syslog(pacconf.use_syslog);
+        alpm.set_disable_dl_timeout(pacconf.disable_download_timeout);
+        alpm.set_parallel_downloads(pacconf.parallel_downloads.min(u32::MAX as u64) as u32);
+        alpm.set_disable_sandbox_filesystem(pacconf.disable_sandbox || pacconf.disable_sandbox_filesystem);
+        alpm.set_disable_sandbox_syscalls(pacconf.disable_sandbox || pacconf.disable_sandbox_syscalls);
+        if let Some(download_user) = pacconf.download_user.as_deref() {
+            alpm.set_sandbox_user(Some(download_user))?;
+        }
 
         let mut cache_dirs = Vec::new();
         for cachedir in &pacconf.cache_dir {
@@ -487,7 +494,18 @@ impl App {
         for pattern in &pacconf.no_extract { alpm.add_noextract(pattern.as_str())?; }
         for group in &pacconf.ignore_group { alpm.add_ignoregroup(group.as_str())?; }
 
-        let arch = pacconf.architecture.first().filter(|arch| arch.as_str() != "auto").cloned().unwrap_or_else(|| std::env::consts::ARCH.to_string());
+        let architectures: Vec<String> = if pacconf.architecture.is_empty()
+            || pacconf.architecture.iter().any(|arch| arch.eq_ignore_ascii_case("auto"))
+        {
+            vec![std::env::consts::ARCH.to_string()]
+        } else {
+            pacconf.architecture.clone()
+        };
+        for architecture in &architectures {
+            alpm.add_architecture(architecture.as_str())?;
+        }
+        let arch = architectures.first().cloned().unwrap_or_else(|| std::env::consts::ARCH.to_string());
+
         for repo in &pacconf.repos {
             for server in &repo.servers {
                 let expanded = server.replace("$repo", &repo.name).replace("$arch", &arch);
