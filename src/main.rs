@@ -385,11 +385,27 @@ fn is_hold_package(name: &str, hold_pkgs: &[String]) -> bool {
     hold_pkgs.iter().any(|pattern| wildcard_matches(pattern, name))
 }
 
-fn parse_package_names(values: &[String]) -> HashSet<String> {
+fn parse_package_names(values: &[String]) -> Vec<String> {
     values
         .iter()
         .flat_map(|value| value.split_whitespace().map(str::to_string))
         .collect()
+}
+
+fn parse_external_ignore_packages(
+    configured: &[String],
+    managed: &HashSet<String>,
+) -> HashSet<String> {
+    // pacmanconf expands Include directives but preserves each IgnorePkg directive.
+    // Subtract one occurrence of each APC-managed package so duplicate external
+    // exclusions remain protected when the same package is also in pacman.conf.
+    let mut packages = parse_package_names(configured);
+    for managed_pkg in managed {
+        if let Some(index) = packages.iter().position(|pkg| pkg == managed_pkg) {
+            packages.remove(index);
+        }
+    }
+    packages.into_iter().collect()
 }
 
 fn parse_managed_ignore_pkg(content: &str) -> HashSet<String> {
@@ -569,10 +585,11 @@ impl App {
             }
         }
 
-        let pacman_conf_ignored_pkgs = parse_package_names(&pacconf.ignore_pkg);
         let mut locked_pkgs = Self::load_locked_packages();
-        // Older APC versions could copy pacman.conf exclusions into the managed file.
-        // Keep those packages externally managed rather than claiming ownership.
+        let pacman_conf_ignored_pkgs =
+            parse_external_ignore_packages(&pacconf.ignore_pkg, &locked_pkgs);
+        // If a package is also excluded outside APC's managed file, external
+        // configuration takes ownership and APC must not offer to unlock it.
         locked_pkgs.retain(|pkg| !pacman_conf_ignored_pkgs.contains(pkg));
         for pkg in locked_pkgs.union(&pacman_conf_ignored_pkgs) {
             alpm.add_ignorepkg(pkg.as_str())?;
@@ -2640,15 +2657,20 @@ mod tests {
         assert!(!combined.contains(SigLevel::DATABASE));
     }
     #[test]
-    fn pacman_conf_ignore_packages_are_parsed_separately() {
+    fn pacman_conf_ignore_packages_are_separated_from_apc_managed_entries() {
         let configured = vec![
             "linux linux-lts".to_string(),
-            "  mesa\n  systemd ".to_string(),
+            "mesa systemd".to_string(),
+            "linux".to_string(),
         ];
-        let parsed = parse_package_names(&configured);
+        let managed: HashSet<String> = ["linux", "mesa"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
         assert_eq!(
-            parsed,
-            ["linux", "linux-lts", "mesa", "systemd"]
+            parse_external_ignore_packages(&configured, &managed),
+            ["linux", "linux-lts", "systemd"]
                 .into_iter()
                 .map(str::to_string)
                 .collect()
