@@ -780,7 +780,7 @@ impl App {
             let result = if any_unlocked {
                 self.alpm.add_ignorepkg(t.as_str())
             } else {
-                self.alpm.remove_ignorepkg(t.as_str())
+                self.alpm.remove_ignorepkg(t.as_str()).map(|_| ())
             };
             if let Err(err) = result {
                 for target in &targets {
