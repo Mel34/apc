@@ -2147,8 +2147,8 @@ fn main() -> Result<()> {
         .write(true)
         .open("/dev/tty")?;
 
-    enable_raw_mode()?;
     let cleanup_tty = tty.try_clone()?;
+    enable_raw_mode()?;
     let mut terminal_guard = TerminalGuard { tty: cleanup_tty };
     execute!(&mut terminal_guard.tty, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(tty);
