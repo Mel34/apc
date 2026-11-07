@@ -1119,7 +1119,12 @@ impl App {
         self.alpm.trans_release()?;
         self.progress = None;
 
-        let lock_error = if lock_version && self.pacman_conf_ignored_pkgs.contains(&pkg_name) {
+        let lock_error = if lock_version
+            && self
+                .pacman_conf_ignored_pkgs
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, &pkg_name))
+        {
             // pacman.conf already owns this exclusion; do not duplicate it in APC's file.
             None
         } else if lock_version {
@@ -1836,7 +1841,14 @@ fn draw_bottom_bar(f: &mut Frame, area: Rect, active: ActivePane, app: &App) {
 
     let current_pkg = app.left.current_pkg();
     let lock_label = match current_pkg {
-        Some(pkg) if app.pacman_conf_ignored_pkgs.contains(&pkg.name) => "Config",
+        Some(pkg)
+            if app
+                .pacman_conf_ignored_pkgs
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, &pkg.name)) =>
+        {
+            "Config"
+        },
         Some(pkg) if app.locked_pkgs.contains(&pkg.name) => "Unlock",
         _ => "Lock",
     };
