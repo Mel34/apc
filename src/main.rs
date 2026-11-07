@@ -1100,12 +1100,70 @@ impl App {
         }
     }
 
-    fn total_download_size_for_packages(&self, targets: &[String]) -> i64 {
-        targets.iter().map(|name| {
-            self.alpm.syncdbs().iter()
-                .find_map(|db| db.pkg(name.as_str()).ok().map(|pkg| pkg.download_size()))
-                .unwrap_or(0)
-        }).sum()
+    fn total_download_size_for_packages(
+        &mut self,
+        targets: &[String],
+        reinstall: bool,
+    ) -> Result<i64> {
+        if self.syncdbs_synced_without_upgrade {
+            anyhow::bail!("Package databases were synchronized separately. Run a full system upgrade (F6) before installing or reinstalling packages.");
+        }
+        check_database_lock(&self.alpm)?;
+
+        let flags = if reinstall { TransFlag::empty() } else { TransFlag::NEEDED };
+        self.alpm.trans_init(flags)?;
+
+        let prepare_result = (|| -> Result<i64> {
+            for name in targets {
+                let pkg = self.alpm.syncdbs().iter()
+                    .find_map(|db| db.pkg(name.as_str()).ok())
+                    .ok_or_else(|| anyhow::anyhow!("Package not found in syncdbs: {name}"))?;
+                self.alpm.trans_add_pkg(pkg)?;
+            }
+
+            self.alpm.trans_prepare()
+                .map_err(|err| anyhow::anyhow!("Transaction prepare failed: {err:?}"))?;
+
+            Ok(self.alpm.trans_add().iter().map(|pkg| pkg.download_size()).sum())
+        })();
+
+        let release_result = self.alpm.trans_release();
+        match (prepare_result, release_result) {
+            (Ok(size), Ok(())) => Ok(size),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err.into()),
+        }
+    }
+
+    fn open_install_confirmation(&mut self, targets: Vec<String>, reinstall: bool) {
+        if targets.is_empty() {
+            return;
+        }
+
+        match self.total_download_size_for_packages(&targets, reinstall) {
+            Ok(total_size) => {
+                let title = if reinstall { "Reinstall" } else { "Install" };
+                let action = if reinstall {
+                    DialogAction::Reinstall(targets.clone())
+                } else {
+                    DialogAction::Install(targets.clone())
+                };
+                self.modal = Some(Modal::Confirm(ConfirmationDialog {
+                    title: title.to_string(),
+                    packages: targets,
+                    additional_removals: Vec::new(),
+                    hold_packages: Vec::new(),
+                    total_size,
+                    selected_button: 1,
+                    button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
+                    action,
+                }));
+            }
+            Err(err) => {
+                let operation = if reinstall { "Reinstall" } else { "Install" };
+                self.modal = Some(Modal::Message(format!("{operation} preview failed: {err}")));
+            }
+        }
     }
 
     fn get_pkg_details(&self, pkg_name: &str, installed: bool) -> Vec<String> {
@@ -2730,20 +2788,7 @@ fn main() -> Result<()> {
                             vec![]
                         };
 
-                        if !targets.is_empty() {
-                            let total_size = app.total_download_size_for_packages(&targets);
-
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Install".to_string(),
-                                packages: targets.clone(),
-                                additional_removals: Vec::new(),
-                                hold_packages: Vec::new(),
-                                total_size,
-                                selected_button: 1,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Install(targets),
-                            }));
-                        }
+                        app.open_install_confirmation(targets, false);
                     }
                 }
                 KeyCode::F(1) => {
@@ -2759,20 +2804,7 @@ fn main() -> Result<()> {
                             vec![]
                         };
 
-                        if !targets.is_empty() {
-                            let total_size = app.total_download_size_for_packages(&targets);
-
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Reinstall".to_string(),
-                                packages: targets.clone(),
-                                additional_removals: Vec::new(),
-                                hold_packages: Vec::new(),
-                                total_size,
-                                selected_button: 1,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Reinstall(targets),
-                            }));
-                        }
+                        app.open_install_confirmation(targets, true);
                     }
                 }
                 KeyCode::F(3) => {
