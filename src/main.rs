@@ -1282,12 +1282,19 @@ impl App {
             &self.pacman_conf_ignored_pkgs,
         );
 
+        let external_ignored = self.pacman_conf_ignored_pkgs.clone();
         update_ignorepkg_state(
             &previous_locked,
             &next_locked,
             &previous_ignorepkgs,
             &next_ignorepkgs,
-            |locked| self.save_locked_packages(locked),
+            |locked| {
+                save_locked_packages_to(
+                    Path::new(IGNORE_PKG_FILE),
+                    &external_ignored,
+                    locked,
+                )
+            },
             |packages| apply_ignorepkgs_verified(&mut self.alpm, packages),
         )?;
 
