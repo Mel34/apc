@@ -1904,7 +1904,7 @@ fn draw_help_dialog(f: &mut Frame) {
         ("F4", "Lock / Unlock package version (\u{f023} via /etc/pacman.d/IgnorePkg)"),
         ("F5", "Downgrade from cache (Left) / Install (Right)"),
         ("F6", "Update system (ALPM equivalent of pacman -Syu)"),
-        ("F8", "Delete selected package(s) (-Rns cascade)"),
+        ("F8", "Remove packages safely (-Rns)"),
         ("F9", "Synchronize databases (pure libalpm)"),
         ("F10", "Quit Arch Package Commander"),
     ];
@@ -2020,8 +2020,6 @@ fn main() -> Result<()> {
             .status()?;
         std::process::exit(status.code().unwrap_or(0));
     }
-
-    check_database_lock(&self.alpm)?;
 
     let mut app = match App::new() {
         Ok(a) => a,
