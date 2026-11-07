@@ -243,23 +243,30 @@ fn clear_question_refusals() {
         .clear();
 }
 
-fn with_question_refusals(message: String) -> String {
+fn take_question_refusal_details() -> Option<String> {
     let refusals = std::mem::take(
         &mut *QUESTION_REFUSALS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
     );
     if refusals.is_empty() {
-        message
+        None
     } else {
-        format!(
-            "{message}\nlibalpm declined these questions using the safe default (No):\n{}",
+        Some(format!(
+            "libalpm declined these questions using the safe default (No):\n{}",
             refusals
                 .iter()
                 .map(|question| format!("  • {question}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        )
+        ))
+    }
+}
+
+fn with_question_refusals(message: String) -> String {
+    match take_question_refusal_details() {
+        Some(details) => format!("{message}\n{details}"),
+        None => message,
     }
 }
 
@@ -1212,6 +1219,9 @@ impl App {
 
             self.alpm.trans_prepare()
                 .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("Transaction prepare failed: {err:?}"))))?;
+            if let Some(details) = take_question_refusal_details() {
+                anyhow::bail!("Install preview stopped: {details}");
+            }
 
             Ok(self.alpm.trans_add().iter().map(|pkg| pkg.download_size()).sum())
         })();
@@ -1458,6 +1468,10 @@ impl App {
             self.progress = None;
             anyhow::bail!("{err_msg}");
         }
+        if let Some(details) = take_question_refusal_details() {
+            let _ = self.alpm.trans_release();
+            anyhow::bail!("Downgrade stopped: {details}");
+        }
 
         if let Err(err) = self.update_progress(
             terminal,
@@ -1586,6 +1600,11 @@ impl App {
             self.progress = None;
             anyhow::bail!("{err_msg}");
         }
+        if let Some(details) = take_question_refusal_details() {
+            let _ = self.alpm.trans_release();
+            self.progress = None;
+            anyhow::bail!("Install stopped: {details}");
+        }
 
         let commit_result = Self::commit_in_tui(terminal, op_name, || {
             self.alpm
@@ -1706,6 +1725,11 @@ impl App {
             let _ = self.alpm.trans_release();
             self.progress = None;
             anyhow::bail!("{err_msg}");
+        }
+        if let Some(details) = take_question_refusal_details() {
+            let _ = self.alpm.trans_release();
+            self.progress = None;
+            anyhow::bail!("System upgrade stopped: {details}");
         }
 
         let mut updates = Vec::new();
