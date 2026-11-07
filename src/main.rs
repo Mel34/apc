@@ -627,6 +627,31 @@ fn updated_ignore_packages(
     updated
 }
 
+fn ignorepkg_lists_match(actual: &[String], expected: &[String]) -> bool {
+    let mut actual_sorted = actual.to_vec();
+    let mut expected_sorted = expected.to_vec();
+    actual_sorted.sort();
+    actual_sorted.dedup();
+    expected_sorted.sort();
+    expected_sorted.dedup();
+    actual_sorted == expected_sorted
+}
+
+fn apply_ignorepkgs_verified(alpm: &Alpm, expected: &[String]) -> Result<()> {
+    let expected_refs: Vec<&str> = expected.iter().map(String::as_str).collect();
+    alpm.set_ignorepkgs(expected_refs.iter())?;
+
+    let actual: Vec<String> = alpm.ignorepkgs().iter().map(str::to_string).collect();
+    if !ignorepkg_lists_match(&actual, expected) {
+        anyhow::bail!(
+            "libalpm accepted the IgnorePkg update but its live list differs from the requested list (expected {} entries, found {})",
+            expected.iter().collect::<HashSet<_>>().len(),
+            actual.iter().collect::<HashSet<_>>().len()
+        );
+    }
+    Ok(())
+}
+
 fn atomic_replace_file(path: &Path, content: &[u8]) -> Result<()> {
     // Resolve an existing symlink so replacing the file does not replace the
     // symlink itself and break pacman.conf's Include chain.
@@ -1170,13 +1195,9 @@ impl App {
         // Persist the complete new managed set before changing the live ALPM handle.
         self.save_locked_packages(&next_locked)?;
 
-        let next_ignorepkg_refs: Vec<&str> =
-            next_ignorepkgs.iter().map(String::as_str).collect();
-        if let Err(err) = self.alpm.set_ignorepkgs(next_ignorepkg_refs.iter()) {
+        if let Err(err) = apply_ignorepkgs_verified(&self.alpm, &next_ignorepkgs) {
             let file_rollback = self.save_locked_packages(&previous_locked);
-            let previous_ignorepkg_refs: Vec<&str> =
-                previous_ignorepkgs.iter().map(String::as_str).collect();
-            let alpm_rollback = self.alpm.set_ignorepkgs(previous_ignorepkg_refs.iter());
+            let alpm_rollback = apply_ignorepkgs_verified(&self.alpm, &previous_ignorepkgs);
 
             let mut message = format!("Failed to update libalpm's IgnorePkg list: {err}");
             if let Err(rollback_err) = file_rollback {
@@ -1623,19 +1644,15 @@ impl App {
                     "Downgrade succeeded, but the package lock could not be saved: {err}"
                 )),
                 Ok(()) => {
-                    let next_ignorepkg_refs: Vec<&str> =
-                        next_ignorepkgs.iter().map(String::as_str).collect();
-                    match self.alpm.set_ignorepkgs(next_ignorepkg_refs.iter()) {
+                    match apply_ignorepkgs_verified(&self.alpm, &next_ignorepkgs) {
                         Ok(()) => {
                             self.locked_pkgs = next_locked;
                             None
                         }
                         Err(err) => {
                             let file_rollback = self.save_locked_packages(&previous_locked);
-                            let previous_ignorepkg_refs: Vec<&str> =
-                                previous_ignorepkgs.iter().map(String::as_str).collect();
                             let alpm_rollback =
-                                self.alpm.set_ignorepkgs(previous_ignorepkg_refs.iter());
+                                apply_ignorepkgs_verified(&self.alpm, &previous_ignorepkgs);
 
                             let mut message = format!(
                                 "Downgrade succeeded, but the package could not be locked in libalpm: {err}"
@@ -3308,6 +3325,14 @@ mod tests {
         ));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignorepkg_list_verification_ignores_order_and_duplicates() {
+        let actual = vec!["linux".to_string(), "external-*".to_string(), "linux".to_string()];
+        let expected = vec!["external-*".to_string(), "linux".to_string()];
+        assert!(ignorepkg_lists_match(&actual, &expected));
+        assert!(!ignorepkg_lists_match(&actual, &["linux".to_string()]));
     }
 
     #[test]
