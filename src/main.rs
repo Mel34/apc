@@ -607,7 +607,19 @@ fn parse_managed_ignore_pkg(content: &str) -> HashSet<String> {
 fn atomic_replace_file(path: &Path, content: &[u8]) -> Result<()> {
     // Resolve an existing symlink so replacing the file does not replace the
     // symlink itself and break pacman.conf's Include chain.
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = match fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(path)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                anyhow::bail!("cannot atomically replace {}: its symlink target does not exist", path.display());
+            }
+            path.to_path_buf()
+        }
+        Err(err) => return Err(err.into()),
+    };
     let parent = target
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", target.display()))?;
