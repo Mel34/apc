@@ -20,6 +20,10 @@ use std::{
     collections::HashSet,
     fs,
     io::{self, Write},
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::AsRawFd,
+    },
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -600,6 +604,84 @@ fn parse_managed_ignore_pkg(content: &str) -> HashSet<String> {
     packages
 }
 
+fn atomic_replace_file(path: &Path, content: &[u8]) -> Result<()> {
+    // Resolve an existing symlink so replacing the file does not replace the
+    // symlink itself and break pacman.conf's Include chain.
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", target.display()))?;
+    let filename = target
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", target.display()))?;
+
+    let existing = match fs::metadata(&target) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let mode = existing
+        .as_ref()
+        .map(|metadata| metadata.mode() & 0o7777)
+        .unwrap_or(0o644);
+
+    let mut temporary_path = None;
+    let mut temporary_file = None;
+    for attempt in 0..100 {
+        let name = format!(
+            ".{}.apc-{}-{attempt}.tmp",
+            filename.to_string_lossy(),
+            std::process::id()
+        );
+        let candidate = parent.join(name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary_path = Some(candidate);
+                temporary_file = Some(file);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let temporary_path = temporary_path
+        .ok_or_else(|| anyhow::anyhow!("could not allocate a temporary file beside {}", target.display()))?;
+    let write_result = (|| -> Result<()> {
+        let mut file = temporary_file.expect("temporary file exists when its path is set");
+
+        if let Some(metadata) = existing.as_ref() {
+            if unsafe { libc::fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+
+        // The temporary file is in the same directory, so rename is atomic.
+        fs::rename(&temporary_path, &target)?;
+
+        // Persist the directory entry where supported. The rename has already
+        // committed if this best-effort durability flush is unavailable.
+        if let Ok(directory) = fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    write_result
+}
+
 struct TerminalGuard {
     tty: std::fs::File,
 }
@@ -952,10 +1034,6 @@ impl App {
     }
 
     fn save_locked_packages(&self) -> Result<()> {
-        let dir = Path::new("/etc/pacman.d");
-        if !dir.exists() {
-            let _ = fs::create_dir_all(dir);
-        }
         let mut list: Vec<&str> = self
             .locked_pkgs
             .iter()
@@ -978,27 +1056,7 @@ impl App {
             )
         };
 
-        if let Err(e) = fs::write(IGNORE_PKG_FILE, &content) {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                let mut child = std::process::Command::new("sudo")
-                    .args(["tee", IGNORE_PKG_FILE])
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::null())
-                    .spawn()?;
-                let mut stdin = child.stdin.take()
-                    .ok_or_else(|| anyhow::anyhow!("Failed to open stdin for sudo tee"))?;
-                stdin.write_all(content.as_bytes())?;
-                drop(stdin);
-
-                let status = child.wait()?;
-                if !status.success() {
-                    anyhow::bail!("sudo tee failed to save package locks (status: {status})");
-                }
-            } else {
-                return Err(e.into());
-            }
-        }
-        Ok(())
+        atomic_replace_file(Path::new(IGNORE_PKG_FILE), content.as_bytes())
     }
 
     fn toggle_lock_current(&mut self) -> Result<()> {
@@ -3191,6 +3249,46 @@ mod tests {
             &mut HashSet::new(),
         ));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_file_replacement_replaces_contents_and_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("apc-atomic-write-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("IgnorePkg");
+        fs::write(&target, "IgnorePkg = old\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+
+        atomic_replace_file(&target, b"IgnorePkg = new\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "IgnorePkg = new\n");
+        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o7777, 0o640);
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+            entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_file_replacement_keeps_existing_symlink_and_replaces_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("apc-atomic-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("managed.conf");
+        let link = root.join("IgnorePkg");
+        fs::write(&target, "IgnorePkg = old\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        atomic_replace_file(&link, b"IgnorePkg = new\n").unwrap();
+
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "IgnorePkg = new\n");
         fs::remove_dir_all(root).unwrap();
     }
 
