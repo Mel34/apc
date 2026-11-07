@@ -1,4 +1,4 @@
-use alpm::{Alpm, AnyDownloadEvent, DownloadEvent, DownloadResult, SigLevel, TransFlag, Usage};
+use alpm::{Alpm, AnyDownloadEvent, DownloadEvent, DownloadResult, Question, SigLevel, TransFlag, Usage};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -831,11 +831,20 @@ impl App {
         // replacement, conflict removal, ignored-package installation, or key import.
         // The refusal is attached to the transaction error so the user sees why it stopped.
         alpm.set_question_cb((), |mut question, _| {
-            question.set_answer(false);
+            let details = format!("{question:?}");
+            match question.question() {
+                Question::InstallIgnorepkg(mut prompt) => prompt.set_install(false),
+                Question::Replace(prompt) => prompt.set_replace(false),
+                Question::Conflict(mut prompt) => prompt.set_remove(false),
+                Question::Corrupted(mut prompt) => prompt.set_remove(false),
+                Question::RemovePkgs(mut prompt) => prompt.set_skip(true),
+                Question::SelectProvider(mut prompt) => prompt.set_index(-1),
+                Question::ImportKey(mut prompt) => prompt.set_import(false),
+            }
             QUESTION_REFUSALS
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(format!("{question:?}"));
+                .push(details);
         });
 
         // Report real package-download progress alongside package-operation progress.
