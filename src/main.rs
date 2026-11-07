@@ -781,6 +781,14 @@ impl App {
         }
     }
 
+    fn total_download_size_for_packages(&self, targets: &[String]) -> i64 {
+        targets.iter().map(|name| {
+            self.alpm.syncdbs().iter()
+                .find_map(|db| db.pkg(name.as_str()).ok().map(|pkg| pkg.download_size()))
+                .unwrap_or(0)
+        }).sum()
+    }
+
     fn get_pkg_details(&self, pkg_name: &str, installed: bool) -> Vec<String> {
         let pkg_opt = if installed {
             self.alpm.localdb().pkg(pkg_name).ok()
@@ -902,7 +910,7 @@ impl App {
                                                 candidates.push(CachedVersionItem {
                                                     path: path.clone(),
                                                     version: loaded_pkg.version().as_str().to_string(),
-                                                    size: loaded_pkg.isize(),
+                                                    size: fs::metadata(&path).map(|metadata| metadata.len().min(i64::MAX as u64) as i64).unwrap_or(0),
                                                     build_date: loaded_pkg.build_date(),
                                                 });
                                             }
@@ -2360,9 +2368,7 @@ fn main() -> Result<()> {
                         };
 
                         if !targets.is_empty() {
-                            let total_size: i64 = targets.iter().filter_map(|t| {
-                                app.right.all_items.iter().find(|p| &p.name == t).map(|p| p.size)
-                            }).sum();
+                            let total_size = app.total_download_size_for_packages(&targets);
 
                             app.modal = Some(Modal::Confirm(ConfirmationDialog {
                                 title: "Install".to_string(),
@@ -2391,9 +2397,7 @@ fn main() -> Result<()> {
                         };
 
                         if !targets.is_empty() {
-                            let total_size: i64 = targets.iter().filter_map(|t| {
-                                app.left.all_items.iter().find(|p| &p.name == t).map(|p| p.size)
-                            }).sum();
+                            let total_size = app.total_download_size_for_packages(&targets);
 
                             app.modal = Some(Modal::Confirm(ConfirmationDialog {
                                 title: "Reinstall".to_string(),
@@ -2433,9 +2437,7 @@ fn main() -> Result<()> {
                         };
 
                         if !targets.is_empty() {
-                            let total_size: i64 = targets.iter().filter_map(|t| {
-                                app.right.all_items.iter().find(|p| &p.name == t).map(|p| p.size)
-                            }).sum();
+                            let total_size = app.total_download_size_for_packages(&targets);
 
                             app.modal = Some(Modal::Confirm(ConfirmationDialog {
                                 title: "Install".to_string(),
