@@ -792,10 +792,14 @@ impl App {
             step: step.to_string(),
             percent,
         });
-        terminal.draw(|f| {
+        if let Err(err) = terminal.draw(|f| {
             draw_ui(f, self);
             BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = Some(f.buffer_mut().clone()));
-        })?;
+        }) {
+            self.progress = None;
+            BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = None);
+            return Err(err.into());
+        }
         thread::sleep(Duration::from_millis(50));
         Ok(())
     }
@@ -974,7 +978,10 @@ impl App {
         self.update_progress(terminal, op_name, &target_desc, "Initializing ALPM transaction...", 15)?;
 
         let flags = if reinstall { TransFlag::empty() } else { TransFlag::NEEDED };
-        self.alpm.trans_init(flags)?;
+        if let Err(err) = self.alpm.trans_init(flags) {
+            self.progress = None;
+            return Err(err.into());
+        }
 
         for name in &targets {
             let mut found = false;
@@ -1064,9 +1071,9 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
+        check_database_lock(&self.alpm)?;
         self.update_progress(terminal, "Syncing Databases", "Configured Mirrors", "Connecting to repository mirrors...", 20)?;
 
-        check_database_lock(&self.alpm)?;
         self.update_progress(terminal, "Syncing Databases", "Core, Extra, Multilib", "Downloading repository databases...", 50)?;
         self.mark_partial_upgrade_pending()?;
         if let Err(err) = self.alpm.syncdbs_mut().update(false) {
@@ -1075,8 +1082,10 @@ impl App {
         }
 
         self.update_progress(terminal, "Syncing Databases", "Local Indices", "Refreshing package lists...", 85)?;
-        self.refresh_available()?;
-        self.refresh_installed()?;
+        if let Err(err) = self.refresh_available().and_then(|_| self.refresh_installed()) {
+            self.progress = None;
+            return Err(err);
+        }
 
         self.update_progress(terminal, "Syncing Databases", "All Repositories", "Synchronization complete!", 100)?;
         thread::sleep(Duration::from_millis(300));
@@ -1097,8 +1106,10 @@ impl App {
             self.progress = None;
             anyhow::bail!("Repository database synchronization failed: {err:?}");
         }
-        self.refresh_available()?;
-        self.refresh_installed()?;
+        if let Err(err) = self.refresh_available().and_then(|_| self.refresh_installed()) {
+            self.progress = None;
+            return Err(err);
+        }
 
         self.update_progress(terminal, "System Upgrade", "Local Packages", "Calculating package updates and new dependencies...", 50)?;
 
@@ -1150,7 +1161,7 @@ impl App {
         self.progress = None;
 
         if updates.is_empty() && new_deps.is_empty() {
-            let _ = self.alpm.trans_release();
+            self.alpm.trans_release()?;
             self.clear_partial_upgrade_pending()?;
             self.modal = Some(Modal::Message("Your system is already up to date! No updates available.".to_string()));
             return Ok(());
