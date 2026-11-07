@@ -1,4 +1,4 @@
-use alpm::{Alpm, SigLevel, TransFlag, Usage};
+use alpm::{Alpm, AnyDownloadEvent, DownloadEvent, DownloadResult, SigLevel, TransFlag, Usage};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -182,6 +182,7 @@ struct ConfirmationDialog {
     action: DialogAction,
 }
 
+#[derive(Clone)]
 struct ProgressState {
     title: String,
     target: String,
@@ -189,16 +190,30 @@ struct ProgressState {
     percent: u16,
 }
 
+#[derive(Clone)]
 struct PackageProgressItem {
     name: String,
     percent: u16,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+struct DownloadProgressItem {
+    name: String,
+    downloaded: i64,
+    total: i64,
+    percent: u16,
+}
+
+#[derive(Clone, Default)]
 struct PackageProgressState {
     packages: Vec<PackageProgressItem>,
     active_package: Option<String>,
     overall_percent: u16,
+    downloads: Vec<DownloadProgressItem>,
+    active_download: Option<String>,
+    download_percent: u16,
+    downloaded_bytes: i64,
+    total_download_bytes: i64,
 }
 
 static PACKAGE_PROGRESS: std::sync::Mutex<PackageProgressState> =
@@ -206,13 +221,58 @@ static PACKAGE_PROGRESS: std::sync::Mutex<PackageProgressState> =
         packages: Vec::new(),
         active_package: None,
         overall_percent: 0,
+        downloads: Vec::new(),
+        active_download: None,
+        download_percent: 0,
+        downloaded_bytes: 0,
+        total_download_bytes: 0,
     });
+
+static QUESTION_REFUSALS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    static ACTIVE_PROGRESS: std::cell::RefCell<Option<ProgressState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn clear_question_refusals() {
+    QUESTION_REFUSALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+fn with_question_refusals(message: String) -> String {
+    let refusals = std::mem::take(
+        &mut *QUESTION_REFUSALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    if refusals.is_empty() {
+        message
+    } else {
+        format!(
+            "{message}\nlibalpm declined these questions using the safe default (No):\n{}",
+            refusals
+                .iter()
+                .map(|question| format!("  • {question}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+}
 
 fn redraw_transaction_progress() {
     let background = BACKGROUND_BUFFER.with(|buffer| buffer.borrow().clone());
     let Some(background) = background else {
         return;
     };
+    let progress = ACTIVE_PROGRESS.with(|progress| progress.borrow().clone());
+    let state = PACKAGE_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
 
     ACTIVE_TERM.with(|term| {
         let terminal_ptr = term.get();
@@ -220,71 +280,11 @@ fn redraw_transaction_progress() {
             return;
         }
 
-        let state = PACKAGE_PROGRESS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
         unsafe {
             let _ = (*terminal_ptr).draw(|frame| {
                 *frame.buffer_mut() = background.clone();
-
-                let area = frame.area();
-                let right_area = Rect {
-                    x: area.x + area.width / 2,
-                    y: area.y,
-                    width: area.width - area.width / 2,
-                    height: area.height.saturating_sub(1),
-                };
-
-                let block = Block::default()
-                    .title("Transaction Progress")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(NC_CYAN));
-                let inner = block.inner(right_area);
-                frame.render_widget(block, right_area);
-
-                if inner.width == 0 || inner.height == 0 {
-                    return;
-                }
-
-                frame.render_widget(
-                    Paragraph::new(format!("Overall: {}%", state.overall_percent))
-                        .style(Style::default().fg(NC_YELLOW)),
-                    Rect {
-                        x: inner.x,
-                        y: inner.y,
-                        width: inner.width,
-                        height: 1,
-                    },
-                );
-
-                for (index, item) in state.packages.iter().enumerate() {
-                    let y = inner.y + 1 + index as u16;
-                    if y >= inner.y + inner.height {
-                        break;
-                    }
-
-                    let active = state.active_package.as_deref() == Some(item.name.as_str());
-                    let color = if active {
-                        NC_YELLOW
-                    } else if item.percent == 100 {
-                        NC_WHITE
-                    } else {
-                        NC_GRAY
-                    };
-
-                    frame.render_widget(
-                        ratatui::widgets::Gauge::default()
-                            .percent(item.percent)
-                            .label(format!("{} {}%", item.name, item.percent))
-                            .gauge_style(Style::default().fg(color)),
-                        Rect {
-                            x: inner.x,
-                            y,
-                            width: inner.width,
-                            height: 1,
-                        },
-                    );
+                if let Some(progress) = progress.as_ref() {
+                    draw_progress_dialog(frame, progress, &state);
                 }
             });
         }
@@ -612,6 +612,7 @@ struct CommitGuard {
 impl Drop for CommitGuard {
     fn drop(&mut self) {
         ACTIVE_TERM.with(|term| term.set(std::ptr::null_mut()));
+        ACTIVE_PROGRESS.with(|progress| *progress.borrow_mut() = None);
         BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = None);
         let mut state = PACKAGE_PROGRESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *state = PackageProgressState::default();
@@ -816,6 +817,73 @@ impl App {
                 state.overall_percent = overall;
             }
 
+            redraw_transaction_progress();
+        });
+
+        // Refuse unresolved ALPM questions rather than silently approving package
+        // replacement, conflict removal, ignored-package installation, or key import.
+        // The refusal is attached to the transaction error so the user sees why it stopped.
+        alpm.set_question_cb((), |mut question, _| {
+            question.set_answer(false);
+            QUESTION_REFUSALS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(format!("{question:?}"));
+        });
+
+        // Report real package-download progress alongside package-operation progress.
+        alpm.set_dl_cb((), |filename, event: AnyDownloadEvent, _| {
+            let mut state = PACKAGE_PROGRESS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            match event.event() {
+                DownloadEvent::Init(_) => {
+                    if !state.downloads.iter().any(|item| item.name == filename) {
+                        state.downloads.push(DownloadProgressItem {
+                            name: filename.to_string(),
+                            downloaded: 0,
+                            total: 0,
+                            percent: 0,
+                        });
+                    }
+                    state.active_download = Some(filename.to_string());
+                }
+                DownloadEvent::Progress(progress) => {
+                    if let Some(item) = state.downloads.iter_mut().find(|item| item.name == filename) {
+                        item.downloaded = progress.downloaded.max(0);
+                        item.total = progress.total.max(0);
+                        item.percent = if item.total > 0 {
+                            ((item.downloaded.saturating_mul(100) / item.total).min(100)) as u16
+                        } else {
+                            0
+                        };
+                    }
+                    state.active_download = Some(filename.to_string());
+                }
+                DownloadEvent::Completed(completed) => {
+                    if let Some(item) = state.downloads.iter_mut().find(|item| item.name == filename) {
+                        item.total = item.total.max(completed.total.max(0));
+                        if matches!(completed.result, DownloadResult::Success | DownloadResult::UpToDate) {
+                            item.downloaded = item.total;
+                            item.percent = 100;
+                        }
+                    }
+                    state.active_download = Some(filename.to_string());
+                }
+                DownloadEvent::Retry(_) => {
+                    state.active_download = Some(filename.to_string());
+                }
+            }
+
+            state.downloaded_bytes = state.downloads.iter().map(|item| item.downloaded).sum();
+            state.total_download_bytes = state.downloads.iter().map(|item| item.total).sum();
+            state.download_percent = if state.total_download_bytes > 0 {
+                ((state.downloaded_bytes.saturating_mul(100) / state.total_download_bytes).min(100)) as u16
+            } else {
+                0
+            };
+            drop(state);
             redraw_transaction_progress();
         });
 
@@ -1036,6 +1104,7 @@ impl App {
 
     fn prepare_removal(&mut self, targets: &[String]) -> Result<(Vec<String>, Vec<String>, i64)> {
         check_database_lock(&self.alpm)?;
+        clear_question_refusals();
         self.alpm.trans_init(TransFlag::RECURSE | TransFlag::UNNEEDED | TransFlag::NO_SAVE)?;
         for name in targets {
             let pkg = match self.alpm.localdb().pkg(name.as_str()) {
@@ -1054,11 +1123,30 @@ impl App {
         }
         let prepare_error = match self.alpm.trans_prepare() {
             Ok(()) => None,
-            Err(err) => Some(format!("{err:?}")),
+            Err(err) => {
+                let mut details = Vec::new();
+                for name in targets {
+                    if let Ok(pkg) = self.alpm.localdb().pkg(name.as_str()) {
+                        let dependents: Vec<String> = pkg
+                            .required_by()
+                            .iter()
+                            .map(|dependent| dependent.to_string())
+                            .collect();
+                        if !dependents.is_empty() {
+                            details.push(format!("{name} is required by {}", dependents.join(", ")));
+                        }
+                    }
+                }
+                let mut message = format!("Safe removal was rejected by dependency checks: {err:?}");
+                if !details.is_empty() {
+                    message.push_str(&format!("\nInstalled dependents: {}", details.join("; ")));
+                }
+                Some(with_question_refusals(message))
+            }
         };
         if let Some(err) = prepare_error {
             let _ = self.alpm.trans_release();
-            anyhow::bail!("Safe removal was rejected by dependency checks: {err}");
+            anyhow::bail!("{err}");
         }
         let removals: Vec<(String, i64)> = self.alpm.trans_remove().iter()
             .map(|pkg| (pkg.name().to_string(), pkg.isize()))
@@ -1113,6 +1201,7 @@ impl App {
         let flags = if reinstall { TransFlag::empty() } else { TransFlag::NEEDED };
         self.alpm.trans_init(flags)?;
 
+        clear_question_refusals();
         let prepare_result = (|| -> Result<i64> {
             for name in targets {
                 let pkg = self.alpm.syncdbs().iter()
@@ -1122,7 +1211,7 @@ impl App {
             }
 
             self.alpm.trans_prepare()
-                .map_err(|err| anyhow::anyhow!("Transaction prepare failed: {err:?}"))?;
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("Transaction prepare failed: {err:?}"))))?;
 
             Ok(self.alpm.trans_add().iter().map(|pkg| pkg.download_size()).sum())
         })();
@@ -1154,7 +1243,7 @@ impl App {
                     additional_removals: Vec::new(),
                     hold_packages: Vec::new(),
                     total_size,
-                    selected_button: 1,
+                    selected_button: 0,
                     button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
                     action,
                 }));
@@ -1215,17 +1304,20 @@ impl App {
         step: &str,
         percent: u16,
     ) -> Result<()> {
-        self.progress = Some(ProgressState {
+        let progress = ProgressState {
             title: title.to_string(),
             target: target.to_string(),
             step: step.to_string(),
             percent,
-        });
+        };
+        self.progress = Some(progress.clone());
+        ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some(progress));
         if let Err(err) = terminal.draw(|f| {
             draw_ui(f, self);
             BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = Some(f.buffer_mut().clone()));
         }) {
             self.progress = None;
+            ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = None);
             BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = None);
             return Err(err.into());
         }
@@ -1338,9 +1430,6 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
         check_database_lock(&self.alpm)?;
-        if self.syncdbs_synced_without_upgrade {
-            anyhow::bail!("Package databases were synchronized separately. Run a full system upgrade (F6) before downgrading packages.");
-        }
 
         let path_str = pkg_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid package path"))?;
         let pkg = self
@@ -1350,6 +1439,7 @@ impl App {
 
         let pkg_name = pkg.name().to_string();
 
+        clear_question_refusals();
         self.alpm.trans_init(TransFlag::empty())?;
         let add_error = match self.alpm.trans_add_pkg(pkg) {
             Ok(()) => None,
@@ -1360,11 +1450,13 @@ impl App {
             anyhow::bail!("Failed to queue package for downgrade: {message}");
         }
 
-        let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
+        let prep_res = self.alpm.trans_prepare().map_err(|err| {
+            with_question_refusals(format!("Downgrade dependency check failed: {err:?}"))
+        });
         if let Err(err_msg) = prep_res {
             let _ = self.alpm.trans_release();
             self.progress = None;
-            anyhow::bail!("Downgrade dependency check failed: {err_msg}");
+            anyhow::bail!("{err_msg}");
         }
 
         if let Err(err) = self.update_progress(
@@ -1441,6 +1533,7 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
         check_database_lock(&self.alpm)?;
+        clear_question_refusals();
 
         if self.syncdbs_synced_without_upgrade {
             anyhow::bail!("Package databases were synchronized separately. Run a full system upgrade (F6) before installing or reinstalling packages.");
@@ -1485,17 +1578,19 @@ impl App {
             self.progress = None;
             return Err(err);
         }
-        let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
+        let prep_res = self.alpm.trans_prepare().map_err(|err| {
+            with_question_refusals(format!("Transaction prepare failed: {err:?}"))
+        });
         if let Err(err_msg) = prep_res {
             let _ = self.alpm.trans_release();
             self.progress = None;
-            anyhow::bail!("Transaction prepare failed: {err_msg}");
+            anyhow::bail!("{err_msg}");
         }
 
         let commit_result = Self::commit_in_tui(terminal, op_name, || {
             self.alpm
                 .trans_commit()
-                .map_err(|e| anyhow::anyhow!("Install commit failed: {e:?}"))
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("Install commit failed: {err:?}"))))
         });
 
         if let Err(err_msg) = commit_result {
@@ -1592,6 +1687,7 @@ impl App {
 
         self.update_progress(terminal, "System Upgrade", "Local Packages", "Calculating package updates and new dependencies...", 50)?;
 
+        clear_question_refusals();
         if let Err(e) = self.alpm.trans_init(TransFlag::empty()) {
             self.progress = None;
             anyhow::bail!("Failed to initialize transaction: {e:?}");
@@ -1603,11 +1699,13 @@ impl App {
             anyhow::bail!("Sysupgrade calculation failed: {e:?}");
         }
 
-        let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
+        let prep_res = self.alpm.trans_prepare().map_err(|err| {
+            with_question_refusals(format!("Dependency resolution / prepare failed: {err:?}"))
+        });
         if let Err(err_msg) = prep_res {
             let _ = self.alpm.trans_release();
             self.progress = None;
-            anyhow::bail!("Dependency resolution / prepare failed: {err_msg}");
+            anyhow::bail!("{err_msg}");
         }
 
         let mut updates = Vec::new();
@@ -1651,7 +1749,7 @@ impl App {
             new_deps,
             total_download_size,
         });
-        self.upgrade_selected_button = 1;
+        self.upgrade_selected_button = 0;
 
         Ok(())
     }
@@ -1678,7 +1776,7 @@ impl App {
         let commit_result = Self::commit_in_tui(terminal, "System Upgrade", || {
             self.alpm
                 .trans_commit()
-                .map_err(|e| anyhow::anyhow!("System upgrade commit failed: {e:?}"))
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("System upgrade commit failed: {err:?}"))))
         });
         self.system_upgrade_in_progress = false;
 
@@ -2316,8 +2414,8 @@ fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
     f.render_widget(p, dialog_rect);
 }
 
-fn draw_progress_dialog(f: &mut Frame, prog: &ProgressState) {
-    let dialog_rect = draw_dialog_box(f, 62, 11);
+fn draw_progress_dialog(f: &mut Frame, prog: &ProgressState, state: &PackageProgressState) {
+    let dialog_rect = draw_dialog_box(f, 72, 14);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2334,7 +2432,7 @@ fn draw_progress_dialog(f: &mut Frame, prog: &ProgressState) {
     let empty = gauge_width - filled;
     let bar_str = format!("[{}{}] {}%", "█".repeat(filled), "░".repeat(empty), prog.percent);
 
-    let text = vec![
+    let mut text = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("Target : ", Style::default().fg(NC_CYAN)),
@@ -2347,6 +2445,33 @@ fn draw_progress_dialog(f: &mut Frame, prog: &ProgressState) {
         Line::from(""),
         Line::from(Span::styled(bar_str, Style::default().fg(NC_CYAN).add_modifier(Modifier::BOLD))),
     ];
+
+    if let Some(active) = state.active_package.as_deref() {
+        let percent = state.packages.iter()
+            .find(|item| item.name == active)
+            .map(|item| item.percent)
+            .unwrap_or(state.overall_percent);
+        text.push(Line::from(Span::styled(
+            format!("Package: {active} ({percent}%)"),
+            Style::default().fg(NC_YELLOW),
+        )));
+    }
+    if let Some(filename) = state.active_download.as_deref() {
+        text.push(Line::from(Span::styled(
+            format!("Download: {filename} ({}%)", state.download_percent),
+            Style::default().fg(NC_CYAN),
+        )));
+        if state.total_download_bytes > 0 {
+            text.push(Line::from(Span::styled(
+                format!(
+                    "Downloaded: {:.1} / {:.1} MiB",
+                    state.downloaded_bytes.max(0) as f64 / (1024.0 * 1024.0),
+                    state.total_download_bytes.max(0) as f64 / (1024.0 * 1024.0),
+                ),
+                Style::default().fg(NC_WHITE),
+            )));
+        }
+    }
 
     let p = Paragraph::new(text).block(block).alignment(Alignment::Center);
     f.render_widget(p, dialog_rect);
@@ -2481,7 +2606,11 @@ fn draw_ui(f: &mut Frame, app: &App) {
             Modal::Message(msg) => draw_message_dialog(f, msg),
         }
     } else if let Some(ref prog) = app.progress {
-        draw_progress_dialog(f, prog);
+        let package_progress = PACKAGE_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        draw_progress_dialog(f, prog, &package_progress);
     }
 }
 
@@ -2498,13 +2627,7 @@ fn main() -> Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let mut app = match App::new() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Failed to initialize ALPM: {e}");
-            return Err(e);
-        }
-    };
+    let mut app = App::new()?;
 
     let tty = std::fs::OpenOptions::new()
         .read(true)
@@ -2659,7 +2782,7 @@ fn main() -> Result<()> {
                                     additional_removals: Vec::new(),
                                     hold_packages: Vec::new(),
                                     total_size: sel.size,
-                                    selected_button: 2,
+                                    selected_button: 1,
                                     button_labels: vec![
                                         "Downgrade & Lock".to_string(),
                                         "Downgrade".to_string(),
