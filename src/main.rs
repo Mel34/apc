@@ -678,10 +678,15 @@ impl App {
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::null())
                     .spawn()?;
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(content.as_bytes())?;
+                let mut stdin = child.stdin.take()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to open stdin for sudo tee"))?;
+                stdin.write_all(content.as_bytes())?;
+                drop(stdin);
+
+                let status = child.wait()?;
+                if !status.success() {
+                    anyhow::bail!("sudo tee failed to save package locks (status: {status})");
                 }
-                child.wait()?;
             } else {
                 return Err(e.into());
             }
