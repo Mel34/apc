@@ -683,13 +683,15 @@ impl App {
             let pkg = match self.alpm.localdb().pkg(name.as_str()) {
                 Ok(pkg) => pkg,
                 Err(err) => {
+                    let message = format!("{err:?}");
                     let _ = self.alpm.trans_release();
-                    anyhow::bail!("Selected package '{name}' is not installed: {err:?}");
+                    anyhow::bail!("Selected package '{name}' is not installed: {message}");
                 }
             };
             if let Err(err) = self.alpm.trans_remove_pkg(pkg) {
+                let message = format!("{err:?}");
                 let _ = self.alpm.trans_release();
-                anyhow::bail!("Cannot queue '{name}' for removal: {err:?}");
+                anyhow::bail!("Cannot queue '{name}' for removal: {message}");
             }
         }
         let prepare_error = match self.alpm.trans_prepare() {
@@ -923,8 +925,9 @@ impl App {
 
         self.alpm.trans_init(TransFlag::empty())?;
         if let Err(err) = self.alpm.trans_add_pkg(pkg) {
+            let message = format!("{err:?}");
             let _ = self.alpm.trans_release();
-            anyhow::bail!("Failed to queue package for downgrade: {err:?}");
+            anyhow::bail!("Failed to queue package for downgrade: {message}");
         }
 
         let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
@@ -1004,9 +1007,10 @@ impl App {
             for db in self.alpm.syncdbs() {
                 if let Ok(pkg) = db.pkg(name.as_str()) {
                     if let Err(err) = self.alpm.trans_add_pkg(pkg) {
+                        let message = format!("{err:?}");
                         let _ = self.alpm.trans_release();
                         self.progress = None;
-                        anyhow::bail!("Failed to add {name} to transaction: {err:?}");
+                        anyhow::bail!("Failed to add {name} to transaction: {message}");
                     }
                     found = true;
                     break;
