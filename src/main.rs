@@ -405,9 +405,8 @@ impl Drop for CommitGuard {
     fn drop(&mut self) {
         ACTIVE_TERM.with(|term| term.set(std::ptr::null_mut()));
         BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = None);
-        if let Ok(mut state) = PACKAGE_PROGRESS.lock() {
-            *state = PackageProgressState::default();
-        }
+        let mut state = PACKAGE_PROGRESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state = PackageProgressState::default();
         if self.saved_stdout >= 0 {
             unsafe { libc::dup2(self.saved_stdout, 1); libc::close(self.saved_stdout); }
         }
@@ -546,49 +545,6 @@ impl App {
             }
         });
 
-        let arch = pacconf
-            .architecture
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "x86_64".to_string());
-
-        // 1. Auto-register local file:// repositories as secondary caches first
-        // (prevents conflicting mutable borrows of alpm)
-        for repo in &pacconf.repos {
-            for server in &repo.servers {
-                let expanded = server
-                    .replace("$repo", &repo.name)
-                    .replace("$arch", &arch);
-                if let Some(local_path) = expanded.strip_prefix("file://") {
-                    let clean_path = local_path.trim_end_matches('/');
-                    if clean_path != "/var/cache/pacman/pkg" && Path::new(clean_path).is_dir() {
-                        let _ = alpm.add_cachedir(clean_path);
-                        if !cache_dirs.contains(&clean_path.to_string()) {
-                            cache_dirs.push(clean_path.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Register syncdb databases
-        for repo in &pacconf.repos {
-            let sig_level = SigLevel::PACKAGE_OPTIONAL | SigLevel::DATABASE_OPTIONAL;
-            if let Ok(db) = alpm.register_syncdb_mut(repo.name.as_str(), sig_level) {
-                for server in &repo.servers {
-                    let expanded = server
-                        .replace("$repo", &repo.name)
-                        .replace("$arch", &arch);
-                    let _ = db.add_server(expanded.as_str());
-                }
-            }
-        }
-
-        let locked_pkgs = Self::load_locked_packages();
-        for pkg in &locked_pkgs {
-            let _ = alpm.add_ignorepkg(pkg.as_str());
-        }
-
         let mut app = Self {
             alpm,
             active_pane: ActivePane::Left,
@@ -597,7 +553,7 @@ impl App {
             info_mode: false,
             locked_pkgs,
             updates_view: None,
-            upgrade_selected_button: 0,
+            upgrade_selected_button: 1,
             downgrade_view: None,
             cache_dirs,
             modal: None,
@@ -1015,7 +971,11 @@ impl App {
             }
         }
 
-        self.update_progress(terminal, op_name, &target_desc, "Resolving dependencies & checking disk space...", 45)?;
+        if let Err(err) = self.update_progress(terminal, op_name, &target_desc, "Resolving dependencies & checking disk space...", 45) {
+            let _ = self.alpm.trans_release();
+            self.progress = None;
+            return Err(err);
+        }
         let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
         if let Err(err_msg) = prep_res {
             let _ = self.alpm.trans_release();
@@ -1178,7 +1138,7 @@ impl App {
             new_deps,
             total_download_size,
         });
-        self.upgrade_selected_button = 0;
+        self.upgrade_selected_button = 1;
 
         Ok(())
     }
@@ -1189,12 +1149,18 @@ impl App {
     ) -> Result<()> {
 
         self.system_upgrade_in_progress = true;
-        terminal.draw(|f| {
+        if let Err(err) = terminal.draw(|f| {
             draw_ui(f, self);
             BACKGROUND_BUFFER.with(|buffer| {
                 *buffer.borrow_mut() = Some(f.buffer_mut().clone());
             });
-        })?;
+        }) {
+            self.system_upgrade_in_progress = false;
+            let _ = self.alpm.trans_release();
+            self.updates_view = None;
+            self.progress = None;
+            return Err(err.into());
+        }
 
         let commit_result = Self::commit_in_tui(terminal, "System Upgrade", || {
             self.alpm
@@ -2169,9 +2135,9 @@ fn main() -> Result<()> {
                                     title: "Downgrade".to_string(),
                                     packages: vec![dg.installed_version.clone()],
                                     additional_removals: Vec::new(),
-                                hold_packages: Vec::new(),
+                                    hold_packages: Vec::new(),
                                     total_size: sel.size,
-                                    selected_button: 0,
+                                    selected_button: 2,
                                     button_labels: vec![
                                         "Downgrade & Lock".to_string(),
                                         "Downgrade".to_string(),
@@ -2311,7 +2277,7 @@ fn main() -> Result<()> {
                                 additional_removals: Vec::new(),
                                 hold_packages: Vec::new(),
                                 total_size,
-                                selected_button: 0,
+                                selected_button: 1,
                                 button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
                                 action: DialogAction::Install(targets),
                             }));
@@ -2342,7 +2308,7 @@ fn main() -> Result<()> {
                                 additional_removals: Vec::new(),
                                 hold_packages: Vec::new(),
                                 total_size,
-                                selected_button: 0,
+                                selected_button: 1,
                                 button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
                                 action: DialogAction::Reinstall(targets),
                             }));
@@ -2384,7 +2350,7 @@ fn main() -> Result<()> {
                                 additional_removals: Vec::new(),
                                 hold_packages: Vec::new(),
                                 total_size,
-                                selected_button: 0,
+                                selected_button: 1,
                                 button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
                                 action: DialogAction::Install(targets),
                             }));
