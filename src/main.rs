@@ -693,6 +693,70 @@ fn apply_ignorepkgs_verified(alpm: &mut Alpm, expected: &[String]) -> Result<()>
     Ok(())
 }
 
+fn save_locked_packages_to(
+    path: &Path,
+    external_ignored: &HashSet<String>,
+    locked_pkgs: &HashSet<String>,
+) -> Result<()> {
+    let mut list: Vec<&str> = locked_pkgs
+        .iter()
+        .filter(|name| {
+            !external_ignored
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, name))
+        })
+        .map(String::as_str)
+        .collect();
+    list.sort();
+
+    let content = if list.is_empty() {
+        "# Managed by Arch Package Commander (apc)\nIgnorePkg =\n".to_string()
+    } else {
+        format!(
+            "# Managed by Arch Package Commander (apc)\nIgnorePkg = {}\n",
+            list.join(" ")
+        )
+    };
+
+    atomic_replace_file(path, content.as_bytes())
+}
+
+fn update_ignorepkg_state<Persist, Apply>(
+    previous_managed: &HashSet<String>,
+    next_managed: &HashSet<String>,
+    previous_ignorepkgs: &[String],
+    next_ignorepkgs: &[String],
+    mut persist: Persist,
+    mut apply: Apply,
+) -> Result<()>
+where
+    Persist: FnMut(&HashSet<String>) -> Result<()>,
+    Apply: FnMut(&[String]) -> Result<()>,
+{
+    // Persist the complete new managed set before changing the live ALPM handle.
+    persist(next_managed)?;
+
+    if let Err(err) = apply(next_ignorepkgs) {
+        let file_rollback = persist(previous_managed);
+        let alpm_rollback = apply(previous_ignorepkgs);
+
+        let mut message = format!("Failed to update libalpm's IgnorePkg list: {err}");
+        if let Err(rollback_err) = file_rollback {
+            message.push_str(&format!(
+                "\nFailed to restore the previous managed IgnorePkg file: {rollback_err}"
+            ));
+        }
+        if let Err(rollback_err) = alpm_rollback {
+            message.push_str(&format!(
+                "\nFailed to restore libalpm's previous IgnorePkg list: {rollback_err}"
+            ));
+        }
+        anyhow::bail!("{message}");
+    }
+
+    Ok(())
+}
+
 fn atomic_replace_file(path: &Path, content: &[u8]) -> Result<()> {
     // Resolve an existing symlink so replacing the file does not replace the
     // symlink itself and break pacman.conf's Include chain.
@@ -1137,28 +1201,11 @@ impl App {
     }
 
     fn save_locked_packages(&self, locked_pkgs: &HashSet<String>) -> Result<()> {
-        let mut list: Vec<&str> = locked_pkgs
-            .iter()
-            .filter(|name| {
-                !self
-                    .pacman_conf_ignored_pkgs
-                    .iter()
-                    .any(|pattern| wildcard_matches(pattern, name))
-            })
-            .map(String::as_str)
-            .collect();
-        list.sort();
-
-        let content = if list.is_empty() {
-            "# Managed by Arch Package Commander (apc)\nIgnorePkg =\n".to_string()
-        } else {
-            format!(
-                "# Managed by Arch Package Commander (apc)\nIgnorePkg = {}\n",
-                list.join(" ")
-            )
-        };
-
-        atomic_replace_file(Path::new(IGNORE_PKG_FILE), content.as_bytes())
+        save_locked_packages_to(
+            Path::new(IGNORE_PKG_FILE),
+            &self.pacman_conf_ignored_pkgs,
+            locked_pkgs,
+        )
     }
 
     fn toggle_lock_current(&mut self) -> Result<()> {
@@ -1235,26 +1282,14 @@ impl App {
             &self.pacman_conf_ignored_pkgs,
         );
 
-        // Persist the complete new managed set before changing the live ALPM handle.
-        self.save_locked_packages(&next_locked)?;
-
-        if let Err(err) = apply_ignorepkgs_verified(&mut self.alpm, &next_ignorepkgs) {
-            let file_rollback = self.save_locked_packages(&previous_locked);
-            let alpm_rollback = apply_ignorepkgs_verified(&mut self.alpm, &previous_ignorepkgs);
-
-            let mut message = format!("Failed to update libalpm's IgnorePkg list: {err}");
-            if let Err(rollback_err) = file_rollback {
-                message.push_str(&format!(
-                    "\nFailed to restore the previous managed IgnorePkg file: {rollback_err}"
-                ));
-            }
-            if let Err(rollback_err) = alpm_rollback {
-                message.push_str(&format!(
-                    "\nFailed to restore libalpm's previous IgnorePkg list: {rollback_err}"
-                ));
-            }
-            anyhow::bail!("{message}");
-        }
+        update_ignorepkg_state(
+            &previous_locked,
+            &next_locked,
+            &previous_ignorepkgs,
+            &next_ignorepkgs,
+            |locked| self.save_locked_packages(locked),
+            |packages| apply_ignorepkgs_verified(&mut self.alpm, packages),
+        )?;
 
         self.locked_pkgs = next_locked;
         self.left.tagged.clear();
