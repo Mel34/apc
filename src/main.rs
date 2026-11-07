@@ -1601,22 +1601,59 @@ impl App {
             // pacman.conf already owns this exclusion; do not duplicate it in APC's file.
             None
         } else if lock_version {
-            let was_locked = self.locked_pkgs.contains(&pkg_name);
-            match self.alpm.add_ignorepkg(pkg_name.as_str()) {
+            let previous_locked = self.locked_pkgs.clone();
+            let mut next_locked = previous_locked.clone();
+            next_locked.insert(pkg_name.clone());
+
+            let previous_ignorepkgs: Vec<String> = self
+                .alpm
+                .ignorepkgs()
+                .iter()
+                .map(str::to_string)
+                .collect();
+            let next_ignorepkgs = updated_ignore_packages(
+                &previous_ignorepkgs,
+                &previous_locked,
+                &next_locked,
+                &self.pacman_conf_ignored_pkgs,
+            );
+
+            match self.save_locked_packages(&next_locked) {
+                Err(err) => Some(format!(
+                    "Downgrade succeeded, but the package lock could not be saved: {err}"
+                )),
                 Ok(()) => {
-                    self.locked_pkgs.insert(pkg_name.clone());
-                    match self.save_locked_packages() {
-                        Ok(()) => None,
+                    let next_ignorepkg_refs: Vec<&str> =
+                        next_ignorepkgs.iter().map(String::as_str).collect();
+                    match self.alpm.set_ignorepkgs(next_ignorepkg_refs.iter()) {
+                        Ok(()) => {
+                            self.locked_pkgs = next_locked;
+                            None
+                        }
                         Err(err) => {
-                            if !was_locked {
-                                self.locked_pkgs.remove(&pkg_name);
-                                let _ = self.alpm.remove_ignorepkg(pkg_name.as_str());
+                            let file_rollback = self.save_locked_packages(&previous_locked);
+                            let previous_ignorepkg_refs: Vec<&str> =
+                                previous_ignorepkgs.iter().map(String::as_str).collect();
+                            let alpm_rollback =
+                                self.alpm.set_ignorepkgs(previous_ignorepkg_refs.iter());
+
+                            let mut message = format!(
+                                "Downgrade succeeded, but the package could not be locked in libalpm: {err}"
+                            );
+                            if let Err(rollback_err) = file_rollback {
+                                message.push_str(&format!(
+                                    "\\nFailed to restore the previous managed IgnorePkg file: {rollback_err}"
+                                ));
                             }
-                            Some(format!("Downgrade succeeded, but the package lock could not be saved: {err}"))
+                            if let Err(rollback_err) = alpm_rollback {
+                                message.push_str(&format!(
+                                    "\\nFailed to restore libalpm's previous IgnorePkg list: {rollback_err}"
+                                ));
+                            }
+                            Some(message)
                         }
                     }
                 }
-                Err(err) => Some(format!("Downgrade succeeded, but the package could not be locked: {err:?}")),
             }
         } else {
             None
