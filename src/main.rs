@@ -1022,11 +1022,27 @@ impl App {
         self.alpm.trans_release()?;
         self.progress = None;
 
-        if lock_version {
-            self.locked_pkgs.insert(pkg_name.clone());
-            let _ = self.alpm.add_ignorepkg(pkg_name.as_str());
-            let _ = self.save_locked_packages();
-        }
+        let lock_error = if lock_version {
+            let was_locked = self.locked_pkgs.contains(&pkg_name);
+            match self.alpm.add_ignorepkg(pkg_name.as_str()) {
+                Ok(()) => {
+                    self.locked_pkgs.insert(pkg_name.clone());
+                    match self.save_locked_packages() {
+                        Ok(()) => None,
+                        Err(err) => {
+                            if !was_locked {
+                                self.locked_pkgs.remove(&pkg_name);
+                                let _ = self.alpm.remove_ignorepkg(pkg_name.as_str());
+                            }
+                            Some(format!("Downgrade succeeded, but the package lock could not be saved: {err}"))
+                        }
+                    }
+                }
+                Err(err) => Some(format!("Downgrade succeeded, but the package could not be locked: {err:?}")),
+            }
+        } else {
+            None
+        };
 
         self.refresh_installed()?;
         self.downgrade_view = None;
