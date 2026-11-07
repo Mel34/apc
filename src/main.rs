@@ -637,7 +637,7 @@ fn ignorepkg_lists_match(actual: &[String], expected: &[String]) -> bool {
     actual_sorted == expected_sorted
 }
 
-fn apply_ignorepkgs_verified(alpm: &Alpm, expected: &[String]) -> Result<()> {
+fn apply_ignorepkgs_verified(alpm: &mut Alpm, expected: &[String]) -> Result<()> {
     let expected_refs: Vec<&str> = expected.iter().map(String::as_str).collect();
     alpm.set_ignorepkgs(expected_refs.iter())?;
 
@@ -1195,9 +1195,9 @@ impl App {
         // Persist the complete new managed set before changing the live ALPM handle.
         self.save_locked_packages(&next_locked)?;
 
-        if let Err(err) = apply_ignorepkgs_verified(&self.alpm, &next_ignorepkgs) {
+        if let Err(err) = apply_ignorepkgs_verified(&mut self.alpm, &next_ignorepkgs) {
             let file_rollback = self.save_locked_packages(&previous_locked);
-            let alpm_rollback = apply_ignorepkgs_verified(&self.alpm, &previous_ignorepkgs);
+            let alpm_rollback = apply_ignorepkgs_verified(&mut self.alpm, &previous_ignorepkgs);
 
             let mut message = format!("Failed to update libalpm's IgnorePkg list: {err}");
             if let Err(rollback_err) = file_rollback {
@@ -1644,7 +1644,7 @@ impl App {
                     "Downgrade succeeded, but the package lock could not be saved: {err}"
                 )),
                 Ok(()) => {
-                    match apply_ignorepkgs_verified(&self.alpm, &next_ignorepkgs) {
+                    match apply_ignorepkgs_verified(&mut self.alpm, &next_ignorepkgs) {
                         Ok(()) => {
                             self.locked_pkgs = next_locked;
                             None
@@ -1652,7 +1652,7 @@ impl App {
                         Err(err) => {
                             let file_rollback = self.save_locked_packages(&previous_locked);
                             let alpm_rollback =
-                                apply_ignorepkgs_verified(&self.alpm, &previous_ignorepkgs);
+                                apply_ignorepkgs_verified(&mut self.alpm, &previous_ignorepkgs);
 
                             let mut message = format!(
                                 "Downgrade succeeded, but the package could not be locked in libalpm: {err}"
