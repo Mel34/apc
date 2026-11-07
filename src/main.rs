@@ -907,7 +907,7 @@ impl App {
             locked_pkgs,
             pacman_conf_ignored_pkgs,
             updates_view: None,
-            upgrade_selected_button: 1,
+            upgrade_selected_button: 0,
             downgrade_view: None,
             cache_dirs,
             modal: None,
@@ -1474,7 +1474,7 @@ impl App {
         let commit_result = Self::commit_in_tui(terminal, "Downgrading Package", || {
             self.alpm
                 .trans_commit()
-                .map_err(|e| anyhow::anyhow!("Downgrade commit failed: {e:?}"))
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("Downgrade commit failed: {err:?}"))))
         });
 
         if let Err(e) = commit_result {
@@ -1760,6 +1760,14 @@ impl App {
     ) -> Result<()> {
 
         self.system_upgrade_in_progress = true;
+        let progress = ProgressState {
+            title: "System Upgrade".to_string(),
+            target: "Selected system upgrade".to_string(),
+            step: "Committing the prepared package transaction...".to_string(),
+            percent: 50,
+        };
+        self.progress = Some(progress.clone());
+        ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some(progress));
         if let Err(err) = terminal.draw(|f| {
             draw_ui(f, self);
             BACKGROUND_BUFFER.with(|buffer| {
@@ -1767,6 +1775,7 @@ impl App {
             });
         }) {
             self.system_upgrade_in_progress = false;
+            ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = None);
             let _ = self.alpm.trans_release();
             self.updates_view = None;
             self.progress = None;
@@ -2455,13 +2464,25 @@ fn draw_progress_dialog(f: &mut Frame, prog: &ProgressState, state: &PackageProg
             format!("Package: {active} ({percent}%)"),
             Style::default().fg(NC_YELLOW),
         )));
+        text.push(Line::from(Span::styled(
+            format!("Package operations: {}%", state.overall_percent),
+            Style::default().fg(NC_WHITE),
+        )));
     }
     if let Some(filename) = state.active_download.as_deref() {
+        let file_percent = state.downloads.iter()
+            .find(|item| item.name == filename)
+            .map(|item| item.percent)
+            .unwrap_or(state.download_percent);
         text.push(Line::from(Span::styled(
-            format!("Download: {filename} ({}%)", state.download_percent),
+            format!("Download: {filename} ({file_percent}%)"),
             Style::default().fg(NC_CYAN),
         )));
         if state.total_download_bytes > 0 {
+            text.push(Line::from(Span::styled(
+                format!("All downloads: {}%", state.download_percent),
+                Style::default().fg(NC_WHITE),
+            )));
             text.push(Line::from(Span::styled(
                 format!(
                     "Downloaded: {:.1} / {:.1} MiB",
