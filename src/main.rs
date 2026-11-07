@@ -94,6 +94,8 @@ enum ActivePane {
 
 struct PaneState {
     all_items: Vec<PkgSummary>,
+    explicit_names: HashSet<String>,
+    show_all_items: bool,
     cursor: usize,
     filter: String,
     tagged: HashSet<String>,
@@ -103,22 +105,47 @@ impl PaneState {
     fn new(items: Vec<PkgSummary>) -> Self {
         Self {
             all_items: items,
+            explicit_names: HashSet::new(),
+            show_all_items: true,
             cursor: 0,
             filter: String::new(),
             tagged: HashSet::new(),
         }
     }
 
-    fn filtered(&self) -> Vec<&PkgSummary> {
-        if self.filter.is_empty() {
-            self.all_items.iter().collect()
-        } else {
-            let f = self.filter.to_lowercase();
-            self.all_items
-                .iter()
-                .filter(|p| p.name.to_lowercase().contains(&f) || self.tagged.contains(&p.name))
-                .collect()
+    fn new_installed(items: Vec<PkgSummary>) -> Self {
+        let mut pane = Self::new(items);
+        pane.show_all_items = false;
+        pane
+    }
+
+    fn set_explicit_names(&mut self, names: HashSet<String>) {
+        self.explicit_names = names;
+        if !self.show_all_items {
+            self.tagged.retain(|name| self.explicit_names.contains(name));
         }
+        self.cursor = 0;
+    }
+
+    fn toggle_installed_scope(&mut self) {
+        self.show_all_items = !self.show_all_items;
+        if !self.show_all_items {
+            self.tagged.retain(|name| self.explicit_names.contains(name));
+        }
+        self.cursor = 0;
+    }
+
+    fn filtered(&self) -> Vec<&PkgSummary> {
+        let filter = self.filter.to_lowercase();
+        self.all_items
+            .iter()
+            .filter(|p| self.show_all_items || self.explicit_names.contains(&p.name))
+            .filter(|p| {
+                filter.is_empty()
+                    || p.name.to_lowercase().contains(&filter)
+                    || self.tagged.contains(&p.name)
+            })
+            .collect()
     }
 
     fn current_pkg(&self) -> Option<&PkgSummary> {
@@ -1075,7 +1102,7 @@ impl App {
         let mut app = Self {
             alpm,
             active_pane: ActivePane::Left,
-            left: PaneState::new(Vec::new()),
+            left: PaneState::new_installed(Vec::new()),
             right: PaneState::new(Vec::new()),
             info_mode: false,
             locked_pkgs,
@@ -2011,9 +2038,14 @@ impl App {
 
     fn refresh_installed(&mut self) -> Result<()> {
         let mut installed = Vec::new();
+        let mut explicit_names = HashSet::new();
         for pkg in self.alpm.localdb().pkgs() {
+            let name = pkg.name().to_string();
+            if pkg.reason() == alpm::PackageReason::Explicit {
+                explicit_names.insert(name.clone());
+            }
             installed.push(PkgSummary {
-                name: pkg.name().to_string(),
+                name,
                 version: pkg.version().as_str().to_string(),
                 desc: pkg.desc().unwrap_or("").to_string(),
                 size: pkg.isize(),
@@ -2021,6 +2053,7 @@ impl App {
         }
         installed.sort_by(|a, b| a.name.cmp(&b.name));
         self.left.all_items = installed;
+        self.left.set_explicit_names(explicit_names);
         Ok(())
     }
 
@@ -2731,6 +2764,7 @@ fn draw_help_dialog(f: &mut Frame) {
         ("F4", "Lock / Unlock APC-managed package versions; pacman.conf exclusions are untouched"),
         ("F5", "Downgrade from cache (Left) / Install (Right)"),
         ("F6", "Update system (ALPM equivalent of pacman -Syu)"),
+        ("F7", "Toggle installed scope (Explicit ⇄ All installed)"),
         ("F8", "Remove packages safely (-Rns)"),
         ("F9", "Synchronize databases (pure libalpm)"),
         ("F10", "Quit Arch Package Commander"),
@@ -2802,10 +2836,15 @@ fn draw_ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[0]);
 
+    let installed_title = if app.left.show_all_items {
+        "Installed Packages (All)"
+    } else {
+        "Installed Packages (Explicit)"
+    };
     draw_pane(
         f,
         pane_chunks[0],
-        "Installed Packages",
+        installed_title,
         &app.left,
         app.active_pane == ActivePane::Left,
         true,
@@ -3187,6 +3226,11 @@ fn main() -> Result<()> {
                         app.modal = Some(Modal::Message(format!("Update Check Failed: {e}")));
                     }
                 }
+                KeyCode::F(7) => {
+                    if app.active_pane == ActivePane::Left {
+                        app.left.toggle_installed_scope();
+                    }
+                }
                 KeyCode::F(8) => {
                     if app.active_pane == ActivePane::Left {
                         let targets: Vec<String> = if !app.left.tagged.is_empty() {
@@ -3240,6 +3284,45 @@ mod tests {
         let names: Vec<&str> = pane.filtered().iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["linux", "vim"]);
     }
+    #[test]
+    fn installed_pane_defaults_to_explicit_and_can_show_all_installed() {
+        let mut pane = PaneState::new_installed(vec![
+            summary("bash"),
+            summary("linux"),
+            summary("vim"),
+        ]);
+        pane.set_explicit_names(
+            ["bash", "vim"].into_iter().map(str::to_string).collect(),
+        );
+
+        let names: Vec<&str> = pane.filtered().iter().map(|pkg| pkg.name.as_str()).collect();
+        assert_eq!(names, vec!["bash", "vim"]);
+
+        pane.toggle_installed_scope();
+        let names: Vec<&str> = pane.filtered().iter().map(|pkg| pkg.name.as_str()).collect();
+        assert_eq!(names, vec!["bash", "linux", "vim"]);
+    }
+
+    #[test]
+    fn switching_back_to_explicit_scope_clears_hidden_dependency_tags() {
+        let mut pane = PaneState::new_installed(vec![
+            summary("bash"),
+            summary("linux"),
+            summary("vim"),
+        ]);
+        pane.set_explicit_names(
+            ["bash", "vim"].into_iter().map(str::to_string).collect(),
+        );
+        pane.toggle_installed_scope();
+        pane.tagged.insert("linux".to_string());
+
+        pane.toggle_installed_scope();
+
+        assert!(!pane.tagged.contains("linux"));
+        let names: Vec<&str> = pane.filtered().iter().map(|pkg| pkg.name.as_str()).collect();
+        assert_eq!(names, vec!["bash", "vim"]);
+    }
+
     #[test]
     fn epoch_date_handles_unix_epoch_and_negative_days() {
         assert_eq!(format_epoch_date(0), "1970-01-01");
