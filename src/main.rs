@@ -931,6 +931,18 @@ impl App {
             anyhow::bail!("Downgrade dependency check failed: {err_msg}");
         }
 
+        if let Err(err) = self.update_progress(
+            terminal,
+            "Downgrading Package",
+            &pkg_name,
+            "Committing the verified cached archive...",
+            50,
+        ) {
+            let _ = self.alpm.trans_release();
+            self.progress = None;
+            return Err(err);
+        }
+
         let commit_result = Self::commit_in_tui(terminal, "Downgrading Package", || {
             self.alpm
                 .trans_commit()
@@ -944,6 +956,7 @@ impl App {
         }
 
         self.alpm.trans_release()?;
+        self.progress = None;
 
         if lock_version {
             self.locked_pkgs.insert(pkg_name.clone());
