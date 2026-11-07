@@ -461,9 +461,12 @@ impl App {
 
     fn new() -> Result<Self> {
         let pacconf = pacmanconf::Config::new()?;
-        let partial_upgrade_marker = Path::new(&pacconf.db_path).join("apc-partial-upgrade-pending");
-        let syncdbs_synced_without_upgrade = partial_upgrade_marker.exists();
         let mut alpm = Alpm::new(pacconf.root_dir.as_str(), pacconf.db_path.as_str())?;
+        let partial_upgrade_marker = Path::new(alpm.lockfile())
+            .parent()
+            .unwrap_or_else(|| Path::new("/var/lib/pacman"))
+            .join("apc-partial-upgrade-pending");
+        let syncdbs_synced_without_upgrade = partial_upgrade_marker.exists();
 
         let global_sig_level = parse_siglevel(
             &pacconf.sig_level,
