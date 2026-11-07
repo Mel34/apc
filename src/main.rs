@@ -1129,7 +1129,8 @@ impl App {
             }
         }
         let prepare_error = match self.alpm.trans_prepare() {
-            Ok(()) => None,
+            Ok(()) => take_question_refusal_details()
+                .map(|details| format!("Removal stopped: {details}")),
             Err(err) => {
                 let mut details = Vec::new();
                 for name in targets {
@@ -1645,7 +1646,7 @@ impl App {
         }
         let commit_result = Self::commit_in_tui(terminal, "Removing Packages", || {
             self.alpm.trans_commit()
-                .map_err(|err| anyhow::anyhow!("Removal commit failed: {err:?}"))
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("Removal commit failed: {err:?}"))))
         });
         let release_result = self.alpm.trans_release();
         self.progress = None;
