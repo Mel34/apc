@@ -1,4 +1,4 @@
-use alpm::{Alpm, SigLevel, TransFlag};
+use alpm::{Alpm, SigLevel, TransFlag, Usage};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -297,6 +297,94 @@ enum Modal {
     Message(String),
 }
 
+fn parse_siglevel(tokens: &[String], mut level: SigLevel) -> Result<SigLevel> {
+    fn set_requirement(level: &mut SigLevel, package: bool, requirement: &str) {
+        let (required, optional) = if package {
+            (SigLevel::PACKAGE, SigLevel::PACKAGE_OPTIONAL)
+        } else {
+            (SigLevel::DATABASE, SigLevel::DATABASE_OPTIONAL)
+        };
+        match requirement {
+            "required" => { level.insert(required); level.remove(optional); }
+            "optional" => { level.remove(required); level.insert(optional); }
+            "never" => { level.remove(required | optional); }
+            _ => {}
+        }
+    }
+    for token in tokens {
+        let value = token.to_ascii_lowercase();
+        match value.as_str() {
+            "required" | "optional" | "never" => {
+                set_requirement(&mut level, true, &value);
+                set_requirement(&mut level, false, &value);
+            }
+            "packagerequired" => set_requirement(&mut level, true, "required"),
+            "packageoptional" => set_requirement(&mut level, true, "optional"),
+            "packagenever" => set_requirement(&mut level, true, "never"),
+            "databaserequired" => set_requirement(&mut level, false, "required"),
+            "databaseoptional" => set_requirement(&mut level, false, "optional"),
+            "databasenever" => set_requirement(&mut level, false, "never"),
+            "trustedonly" => level.remove(
+                SigLevel::PACKAGE_MARGINAL_OK | SigLevel::PACKAGE_UNKNOWN_OK |
+                SigLevel::DATABASE_MARGINAL_OK | SigLevel::DATABASE_UNKNOWN_OK
+            ),
+            "packagetrustedonly" => level.remove(SigLevel::PACKAGE_MARGINAL_OK | SigLevel::PACKAGE_UNKNOWN_OK),
+            "databasetrustedonly" => level.remove(SigLevel::DATABASE_MARGINAL_OK | SigLevel::DATABASE_UNKNOWN_OK),
+            "trustall" => level.insert(
+                SigLevel::PACKAGE_MARGINAL_OK | SigLevel::PACKAGE_UNKNOWN_OK |
+                SigLevel::DATABASE_MARGINAL_OK | SigLevel::DATABASE_UNKNOWN_OK
+            ),
+            "packagetrustall" => level.insert(SigLevel::PACKAGE_MARGINAL_OK | SigLevel::PACKAGE_UNKNOWN_OK),
+            "databasetrustall" => level.insert(SigLevel::DATABASE_MARGINAL_OK | SigLevel::DATABASE_UNKNOWN_OK),
+            "packagemarginalok" => level.insert(SigLevel::PACKAGE_MARGINAL_OK),
+            "packageunknownok" => level.insert(SigLevel::PACKAGE_UNKNOWN_OK),
+            "databasemarginalok" => level.insert(SigLevel::DATABASE_MARGINAL_OK),
+            "databaseunknownok" => level.insert(SigLevel::DATABASE_UNKNOWN_OK),
+            _ => anyhow::bail!("Unsupported SigLevel option in pacman.conf: {token}"),
+        }
+    }
+    Ok(level)
+}
+
+fn parse_repo_usage(tokens: &[String]) -> Result<Usage> {
+    if tokens.is_empty() || tokens.iter().any(|v| v.eq_ignore_ascii_case("all")) {
+        return Ok(Usage::ALL);
+    }
+    let mut usage = Usage::NONE;
+    for token in tokens {
+        match token.to_ascii_lowercase().as_str() {
+            "sync" => usage.insert(Usage::SYNC),
+            "search" => usage.insert(Usage::SEARCH),
+            "install" => usage.insert(Usage::INSTALL),
+            "upgrade" => usage.insert(Usage::UPGRADE),
+            _ => anyhow::bail!("Unsupported repository Usage option: {token}"),
+        }
+    }
+    Ok(usage)
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+    for ch in pattern {
+        if ch == '*' {
+            for index in 1..=value.len() { matched[index] = matched[index] || matched[index - 1]; }
+        } else {
+            for index in (1..=value.len()).rev() {
+                matched[index] = matched[index - 1] && (ch == '?' || ch == value[index - 1]);
+            }
+            matched[0] = false;
+        }
+    }
+    matched[value.len()]
+}
+
+fn is_hold_package(name: &str, hold_pkgs: &[String]) -> bool {
+    hold_pkgs.iter().any(|pattern| wildcard_matches(pattern, name))
+}
+
 struct App {
     alpm: Alpm,
     active_pane: ActivePane,
@@ -311,36 +399,64 @@ struct App {
     modal: Option<Modal>,
     progress: Option<ProgressState>,
     system_upgrade_in_progress: bool,
+    syncdbs_synced_without_upgrade: bool,
+    hold_pkgs: Vec<String>,
     should_quit: bool,
 }
 
 impl App {
     fn new() -> Result<Self> {
-        let pacconf = pacmanconf::Config::new().unwrap_or_default();
-        let mut alpm = Alpm::new(
-            pacconf.root_dir.as_str(),
-            pacconf.db_path.as_str(),
+        let pacconf = pacmanconf::Config::new()?;
+        let mut alpm = Alpm::new(pacconf.root_dir.as_str(), pacconf.db_path.as_str())?;
+
+        let global_sig_level = parse_siglevel(
+            &pacconf.sig_level,
+            SigLevel::PACKAGE | SigLevel::DATABASE,
         )?;
+        alpm.set_default_siglevel(global_sig_level)?;
+        alpm.set_local_file_siglevel(parse_siglevel(&pacconf.local_file_sig_level, global_sig_level)?)?;
+        alpm.set_remote_file_siglevel(parse_siglevel(&pacconf.remote_file_sig_level, global_sig_level)?)?;
+        alpm.set_gpgdir(pacconf.gpg_dir.as_str())?;
+        alpm.set_logfile(pacconf.log_file.as_str())?;
+        alpm.set_check_space(pacconf.check_space);
+        alpm.set_use_syslog(pacconf.use_syslog);
 
-        // Connect pacman.log
-        let _ = alpm.set_logfile(pacconf.log_file.as_str());
-
-        // 1. Ensure the official system cache is ALWAYS the primary write directory
-        let default_cache = "/var/cache/pacman/pkg/";
-        let _ = alpm.add_cachedir(default_cache);
-
-        let mut cache_dirs = vec![default_cache.to_string()];
-
-        // 2. Register any other custom/local cachedirs as secondary caches
+        let mut cache_dirs = Vec::new();
         for cachedir in &pacconf.cache_dir {
-            let clean_dir = cachedir.trim_end_matches('/');
-            if clean_dir != "/var/cache/pacman/pkg" {
-                let _ = alpm.add_cachedir(cachedir.as_str());
-            }
-            if !cache_dirs.contains(cachedir) {
-                cache_dirs.push(cachedir.clone());
+            alpm.add_cachedir(cachedir.as_str())?;
+            if !cache_dirs.contains(cachedir) { cache_dirs.push(cachedir.clone()); }
+        }
+        for hook_dir in &pacconf.hook_dir { alpm.add_hookdir(hook_dir.as_str())?; }
+        for pattern in &pacconf.no_upgrade { alpm.add_noupgrade(pattern.as_str())?; }
+        for pattern in &pacconf.no_extract { alpm.add_noextract(pattern.as_str())?; }
+        for group in &pacconf.ignore_group { alpm.add_ignoregroup(group.as_str())?; }
+
+        let arch = pacconf.architecture.first().cloned().unwrap_or_else(|| "x86_64".to_string());
+        for repo in &pacconf.repos {
+            for server in &repo.servers {
+                let expanded = server.replace("$repo", &repo.name).replace("$arch", &arch);
+                if let Some(local_path) = expanded.strip_prefix("file://") {
+                    let clean_path = local_path.trim_end_matches('/');
+                    if clean_path != "/var/cache/pacman/pkg" && Path::new(clean_path).is_dir() {
+                        alpm.add_cachedir(clean_path)?;
+                        let clean_string = clean_path.to_string();
+                        if !cache_dirs.contains(&clean_string) { cache_dirs.push(clean_string); }
+                    }
+                }
             }
         }
+        for repo in &pacconf.repos {
+            let repo_sig_level = parse_siglevel(&repo.sig_level, global_sig_level)?;
+            let db = alpm.register_syncdb_mut(repo.name.as_str(), repo_sig_level)?;
+            db.set_usage(parse_repo_usage(&repo.usage)?)?;
+            for server in &repo.servers {
+                let expanded = server.replace("$repo", &repo.name).replace("$arch", &arch);
+                db.add_server(expanded.as_str())?;
+            }
+        }
+
+        let locked_pkgs = Self::load_locked_packages(&pacconf.ignore_pkg);
+        for pkg in &locked_pkgs { alpm.add_ignorepkg(pkg.as_str())?; }
 
         // Live In-TUI progress callback: record package progress and redraw the current dialog
         alpm.set_progress_cb((), move |progress, pkgname, percent, howmany, current, _| {
@@ -455,6 +571,8 @@ impl App {
             modal: None,
             progress: None,
             system_upgrade_in_progress: false,
+            syncdbs_synced_without_upgrade: false,
+            hold_pkgs: pacconf.hold_pkg.clone(),
             should_quit: false,
         };
 
@@ -463,8 +581,8 @@ impl App {
         Ok(app)
     }
 
-    fn load_locked_packages() -> HashSet<String> {
-        let mut locked = HashSet::new();
+    fn load_locked_packages(configured: &[String]) -> HashSet<String> {
+        let mut locked: HashSet<String> = configured.iter().cloned().collect();
         if let Ok(content) = fs::read_to_string(IGNORE_PKG_FILE) {
             for line in content.lines() {
                 let trimmed = line.trim();
