@@ -491,7 +491,7 @@ fn expand_include_pattern(pattern: &str, config_path: &Path) -> Vec<std::path::P
                     candidates = matches;
                 } else {
                     for candidate in &mut candidates {
-                        candidate.push(name.as_ref());
+                        candidate.push(name.to_string());
                     }
                 }
             }
