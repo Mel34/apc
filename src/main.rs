@@ -160,7 +160,7 @@ impl PaneState {
 }
 
 enum DialogAction {
-    Delete(Vec<String>),
+    Delete,
     Install(Vec<String>),
     Reinstall(Vec<String>),
     Downgrade {
@@ -174,7 +174,8 @@ enum DialogAction {
 struct ConfirmationDialog {
     title: String,
     packages: Vec<String>,
-    cascade: Vec<String>,
+    additional_removals: Vec<String>,
+    hold_packages: Vec<String>,
     total_size: i64,
     selected_button: usize,
     button_labels: Vec<String>,
@@ -551,41 +552,68 @@ impl App {
         Ok(())
     }
 
-    fn get_removal_cascade(&self, targets: &[String]) -> (Vec<String>, i64) {
-        let mut to_remove = HashSet::new();
-        let mut queue = Vec::new();
-
-        for t in targets {
-            to_remove.insert(t.clone());
-            queue.push(t.clone());
-        }
-
-        while let Some(current) = queue.pop() {
-            for pkg in self.alpm.localdb().pkgs() {
-                let name = pkg.name().to_string();
-                if to_remove.contains(&name) {
-                    continue;
+    fn prepare_removal(&mut self, targets: &[String]) -> Result<(Vec<String>, Vec<String>, i64)> {
+        check_database_lock(&self.alpm)?;
+        self.alpm.trans_init(TransFlag::RECURSE | TransFlag::UNNEEDED | TransFlag::NO_SAVE)?;
+        for name in targets {
+            let pkg = match self.alpm.localdb().pkg(name.as_str()) {
+                Ok(pkg) => pkg,
+                Err(err) => {
+                    let _ = self.alpm.trans_release();
+                    anyhow::bail!("Selected package '{name}' is not installed: {err:?}");
                 }
-                let depends_on_current = pkg.depends().into_iter().any(|dep| dep.name() == current);
-                if depends_on_current {
-                    to_remove.insert(name.clone());
-                    queue.push(name);
-                }
+            };
+            if let Err(err) = self.alpm.trans_remove_pkg(pkg) {
+                let _ = self.alpm.trans_release();
+                anyhow::bail!("Cannot queue '{name}' for removal: {err:?}");
             }
         }
+        let prepare_error = match self.alpm.trans_prepare() {
+            Ok(()) => None,
+            Err(err) => Some(format!("{err:?}")),
+        };
+        if let Some(err) = prepare_error {
+            let _ = self.alpm.trans_release();
+            anyhow::bail!("Safe removal was rejected by dependency checks: {err}");
+        }
+        let removals: Vec<(String, i64)> = self.alpm.trans_remove().iter()
+            .map(|pkg| (pkg.name().to_string(), pkg.isize()))
+            .collect();
+        let removal_names: HashSet<String> = removals.iter().map(|(name, _)| name.clone()).collect();
+        if let Some(missing) = targets.iter().find(|name| !removal_names.contains(*name)) {
+            let _ = self.alpm.trans_release();
+            anyhow::bail!("libalpm did not include selected package '{missing}' in the prepared removal transaction");
+        }
+        let mut additional: Vec<String> = removals.iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| !targets.contains(name))
+            .collect();
+        additional.sort();
+        let total_size = removals.iter().map(|(_, size)| *size).sum();
+        let hold_packages: Vec<String> = removals.iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| is_hold_package(name, &self.hold_pkgs))
+            .collect();
+        Ok((additional, hold_packages, total_size))
+    }
 
-        let mut total_size = 0i64;
-        let mut cascade_list = Vec::new();
-        for name in &to_remove {
-            if let Ok(pkg) = self.alpm.localdb().pkg(name.as_str()) {
-                total_size += pkg.isize();
+    fn open_removal_confirmation(&mut self, targets: Vec<String>) {
+        if targets.is_empty() { return; }
+        match self.prepare_removal(&targets) {
+            Ok((additional_removals, hold_packages, total_size)) => {
+                self.modal = Some(Modal::Confirm(ConfirmationDialog {
+                    title: "Remove packages (-Rns)".to_string(),
+                    packages: targets,
+                    additional_removals,
+                    hold_packages,
+                    total_size,
+                    selected_button: 1,
+                    button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
+                    action: DialogAction::Delete,
+                }));
             }
-            if !targets.contains(name) {
-                cascade_list.push(name.clone());
-            }
+            Err(err) => self.modal = Some(Modal::Message(format!("Removal blocked: {err}"))),
         }
-        cascade_list.sort();
-        (cascade_list, total_size)
     }
 
     fn get_pkg_details(&self, pkg_name: &str, installed: bool) -> Vec<String> {
@@ -893,50 +921,32 @@ impl App {
 
     fn alpm_remove(
         &mut self,
-        targets: Vec<String>,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
-        check_and_clean_stale_lock();
-
-        let target_desc = targets.join(", ");
-
-        self.update_progress(terminal, "Deleting Packages", &target_desc, "Initializing removal transaction...", 15)?;
-        self.alpm.trans_init(TransFlag::RECURSE | TransFlag::UNNEEDED)?;
-
-        for name in &targets {
-            if let Ok(pkg) = self.alpm.localdb().pkg(name.as_str()) {
-                self.alpm
-                    .trans_remove_pkg(pkg)
-                    .map_err(|e| anyhow::anyhow!("Failed to mark {name} for removal: {e:?}"))?;
-            }
-        }
-
-        self.update_progress(terminal, "Deleting Packages", &target_desc, "Resolving dependency cascades (-Rns)...", 50)?;
-        let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
-        if let Err(err_msg) = prep_res {
+        if let Err(err) = self.update_progress(
+            terminal,
+            "Removing Packages",
+            "Prepared removal transaction",
+            "Committing the reviewed -Rns package set...",
+            50,
+        ) {
             let _ = self.alpm.trans_release();
             self.progress = None;
-            anyhow::bail!("Transaction prepare failed: {err_msg}");
+            return Err(err);
         }
-
-        let commit_result = Self::commit_in_tui(terminal, "Deleting Packages", || {
-            self.alpm
-                .trans_commit()
-                .map_err(|e| anyhow::anyhow!("Removal commit failed: {e:?}"))
+        let commit_result = Self::commit_in_tui(terminal, "Removing Packages", || {
+            self.alpm.trans_commit()
+                .map_err(|err| anyhow::anyhow!("Removal commit failed: {err:?}"))
         });
-
-        if let Err(err_msg) = commit_result {
-            let _ = self.alpm.trans_release();
-            self.progress = None;
-            return Err(err_msg);
+        let release_result = self.alpm.trans_release();
+        self.progress = None;
+        if let Err(err) = commit_result {
+            let _ = release_result;
+            return Err(err);
         }
-
-        self.alpm.trans_release()?;
+        release_result?;
         self.refresh_installed()?;
         self.left.tagged.clear();
-
-        self.progress = None;
         flush_events()?;
         Ok(())
     }
@@ -1584,7 +1594,7 @@ fn draw_dialog_box(f: &mut Frame, width: u16, height: u16) -> Rect {
 }
 
 fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
-    let dialog_rect = draw_dialog_box(f, 70, 16);
+    let dialog_rect = draw_dialog_box(f, 70, 18);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1605,7 +1615,7 @@ fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
     let size_mib = diag.total_size as f64 / (1024.0 * 1024.0);
 
     let (prompt_text, action_color, size_label) = match diag.action {
-        DialogAction::Delete(_) => (
+        DialogAction::Delete => (
             "You are about to delete:",
             Color::Red,
             format!("Total space to free: {:.2} MiB", size_mib),
@@ -1633,16 +1643,23 @@ fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
         Line::from(Span::styled(format!("  • {}", targets_preview), Style::default().fg(action_color).add_modifier(Modifier::BOLD))),
     ];
 
-    if !diag.cascade.is_empty() {
-        let cascade_preview = if diag.cascade.len() > 5 {
-            format!("{} (+{} more)", diag.cascade[..5].join(", "), diag.cascade.len() - 5)
+    if !diag.additional_removals.is_empty() {
+        let removal_preview = if diag.additional_removals.len() > 5 {
+            format!("{} (+{} more)", diag.additional_removals[..5].join(", "), diag.additional_removals.len() - 5)
         } else {
-            diag.cascade.join(", ")
+            diag.additional_removals.join(", ")
         };
         lines.push(Line::from(""));
-        let sub_title = "Dependent packages that will also be removed:";
+        let sub_title = "Additional packages removed by the prepared -Rns transaction:";
         lines.push(Line::from(Span::styled(sub_title, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
-        lines.push(Line::from(Span::styled(format!("  • {}", cascade_preview), Style::default().fg(NC_BLACK))));
+        lines.push(Line::from(Span::styled(format!("  • {}", removal_preview), Style::default().fg(NC_BLACK))));
+    }
+    if !diag.hold_packages.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("HoldPkg warning: {}", diag.hold_packages.join(", ")),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
     }
 
     lines.push(Line::from(""));
@@ -1929,13 +1946,16 @@ fn main() -> Result<()> {
                             app.modal = Some(modal);
                         }
                         KeyCode::Enter => {
-                            let action = std::mem::replace(&mut diag.action, DialogAction::Delete(Vec::new()));
+                            let action = std::mem::replace(&mut diag.action, DialogAction::Delete);
                             match action {
-                                DialogAction::Delete(targets) => {
+                                DialogAction::Delete => {
                                     if diag.selected_button == 0 {
-                                        if let Err(e) = app.alpm_remove(targets, &mut terminal) {
+                                        if let Err(e) = app.alpm_remove(&mut terminal) {
                                             app.modal = Some(Modal::Message(format!("Error: {e}")));
                                         }
+                                    } else {
+                                        let _ = app.alpm.trans_release();
+                                        app.progress = None;
                                     }
                                 }
                                 DialogAction::Install(targets) => {
@@ -1967,7 +1987,12 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
-                        KeyCode::Esc => {}
+                        KeyCode::Esc => {
+                            if matches!(&diag.action, DialogAction::Delete) {
+                                let _ = app.alpm.trans_release();
+                                app.progress = None;
+                            }
+                        }
                         _ => {
                             app.modal = Some(modal);
                         }
@@ -2012,7 +2037,8 @@ fn main() -> Result<()> {
                                 app.modal = Some(Modal::Confirm(ConfirmationDialog {
                                     title: "Downgrade".to_string(),
                                     packages: vec![dg.installed_version.clone()],
-                                    cascade: Vec::new(),
+                                    additional_removals: Vec::new(),
+                                hold_packages: Vec::new(),
                                     total_size: sel.size,
                                     selected_button: 0,
                                     button_labels: vec![
@@ -2132,16 +2158,7 @@ fn main() -> Result<()> {
                         };
 
                         if !targets.is_empty() {
-                            let (cascade, total_size) = app.get_removal_cascade(&targets);
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Delete".to_string(),
-                                packages: targets.clone(),
-                                cascade,
-                                total_size,
-                                selected_button: 0,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Delete(targets),
-                            }));
+                            app.open_removal_confirmation(targets);
                         }
                     } else {
                         let targets: Vec<String> = if !app.right.tagged.is_empty() {
@@ -2160,7 +2177,8 @@ fn main() -> Result<()> {
                             app.modal = Some(Modal::Confirm(ConfirmationDialog {
                                 title: "Install".to_string(),
                                 packages: targets.clone(),
-                                cascade: Vec::new(),
+                                additional_removals: Vec::new(),
+                                hold_packages: Vec::new(),
                                 total_size,
                                 selected_button: 0,
                                 button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
@@ -2190,7 +2208,8 @@ fn main() -> Result<()> {
                             app.modal = Some(Modal::Confirm(ConfirmationDialog {
                                 title: "Reinstall".to_string(),
                                 packages: targets.clone(),
-                                cascade: Vec::new(),
+                                additional_removals: Vec::new(),
+                                hold_packages: Vec::new(),
                                 total_size,
                                 selected_button: 0,
                                 button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
@@ -2231,7 +2250,8 @@ fn main() -> Result<()> {
                             app.modal = Some(Modal::Confirm(ConfirmationDialog {
                                 title: "Install".to_string(),
                                 packages: targets.clone(),
-                                cascade: Vec::new(),
+                                additional_removals: Vec::new(),
+                                hold_packages: Vec::new(),
                                 total_size,
                                 selected_button: 0,
                                 button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
@@ -2256,16 +2276,7 @@ fn main() -> Result<()> {
                         };
 
                         if !targets.is_empty() {
-                            let (cascade, total_size) = app.get_removal_cascade(&targets);
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Delete".to_string(),
-                                packages: targets.clone(),
-                                cascade,
-                                total_size,
-                                selected_button: 0,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Delete(targets),
-                            }));
+                            app.open_removal_confirmation(targets);
                         }
                     }
                 }
