@@ -1048,6 +1048,9 @@ impl App {
         self.downgrade_view = None;
         self.active_pane = ActivePane::Left;
         flush_events()?;
+        if let Some(message) = lock_error {
+            anyhow::bail!("{message}");
+        }
         Ok(())
     }
 
