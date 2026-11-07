@@ -385,6 +385,29 @@ fn is_hold_package(name: &str, hold_pkgs: &[String]) -> bool {
     hold_pkgs.iter().any(|pattern| wildcard_matches(pattern, name))
 }
 
+fn parse_package_names(values: &[String]) -> HashSet<String> {
+    values
+        .iter()
+        .flat_map(|value| value.split_whitespace().map(str::to_string))
+        .collect()
+}
+
+fn parse_managed_ignore_pkg(content: &str) -> HashSet<String> {
+    let mut packages = HashSet::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("IgnorePkg") {
+                packages.extend(value.split_whitespace().map(str::to_string));
+            }
+        }
+    }
+    packages
+}
+
 struct TerminalGuard {
     tty: std::fs::File,
 }
@@ -423,6 +446,7 @@ struct App {
     right: PaneState,
     info_mode: bool,
     locked_pkgs: HashSet<String>,
+    pacman_conf_ignored_pkgs: HashSet<String>,
     updates_view: Option<SysUpdateInfo>,
     upgrade_selected_button: usize,
     downgrade_view: Option<DowngradeView>,
@@ -545,8 +569,14 @@ impl App {
             }
         }
 
-        let locked_pkgs = Self::load_locked_packages(&pacconf.ignore_pkg);
-        for pkg in &locked_pkgs { alpm.add_ignorepkg(pkg.as_str())?; }
+        let pacman_conf_ignored_pkgs = parse_package_names(&pacconf.ignore_pkg);
+        let mut locked_pkgs = Self::load_locked_packages();
+        // Older APC versions could copy pacman.conf exclusions into the managed file.
+        // Keep those packages externally managed rather than claiming ownership.
+        locked_pkgs.retain(|pkg| !pacman_conf_ignored_pkgs.contains(pkg));
+        for pkg in locked_pkgs.union(&pacman_conf_ignored_pkgs) {
+            alpm.add_ignorepkg(pkg.as_str())?;
+        }
         let hold_pkgs: Vec<String> = pacconf.hold_pkg.iter()
             .flat_map(|value| value.split_whitespace().map(str::to_string))
             .collect();
@@ -614,6 +644,7 @@ impl App {
             right: PaneState::new(Vec::new()),
             info_mode: false,
             locked_pkgs,
+            pacman_conf_ignored_pkgs,
             updates_view: None,
             upgrade_selected_button: 1,
             downgrade_view: None,
@@ -632,26 +663,14 @@ impl App {
         Ok(app)
     }
 
-    fn load_locked_packages(configured: &[String]) -> HashSet<String> {
-        let mut locked: HashSet<String> = configured.iter()
-            .flat_map(|value| value.split_whitespace().map(str::to_string))
-            .collect();
-        if let Ok(content) = fs::read_to_string(IGNORE_PKG_FILE) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with('#') || trimmed.is_empty() {
-                    continue;
-                }
-                if let Some((key, val)) = trimmed.split_once('=') {
-                    if key.trim().eq_ignore_ascii_case("IgnorePkg") {
-                        for pkg in val.split_whitespace() {
-                            locked.insert(pkg.trim().to_string());
-                        }
-                    }
-                }
-            }
-        }
-        locked
+    fn load_locked_packages() -> HashSet<String> {
+        fs::read_to_string(IGNORE_PKG_FILE)
+            .map(|content| parse_managed_ignore_pkg(&content))
+            .unwrap_or_default()
+    }
+
+    fn is_package_locked(&self, name: &str) -> bool {
+        self.locked_pkgs.contains(name) || self.pacman_conf_ignored_pkgs.contains(name)
     }
 
     fn save_locked_packages(&self) -> Result<()> {
@@ -659,7 +678,12 @@ impl App {
         if !dir.exists() {
             let _ = fs::create_dir_all(dir);
         }
-        let mut list: Vec<&str> = self.locked_pkgs.iter().map(|s| s.as_str()).collect();
+        let mut list: Vec<&str> = self
+            .locked_pkgs
+            .iter()
+            .filter(|name| !self.pacman_conf_ignored_pkgs.contains(*name))
+            .map(String::as_str)
+            .collect();
         list.sort();
 
         let content = if list.is_empty() {
@@ -702,6 +726,18 @@ impl App {
         } else {
             return Ok(());
         };
+
+        let externally_locked: Vec<&str> = targets
+            .iter()
+            .filter(|target| self.pacman_conf_ignored_pkgs.contains(*target))
+            .map(String::as_str)
+            .collect();
+        if !externally_locked.is_empty() {
+            anyhow::bail!(
+                "Cannot change {}: excluded by pacman.conf; APC leaves those settings untouched",
+                externally_locked.join(", ")
+            );
+        }
 
         let previous_locked = self.locked_pkgs.clone();
         let any_unlocked = targets.iter().any(|t| !previous_locked.contains(t));
@@ -1049,7 +1085,10 @@ impl App {
         self.alpm.trans_release()?;
         self.progress = None;
 
-        let lock_error = if lock_version {
+        let lock_error = if lock_version && self.pacman_conf_ignored_pkgs.contains(&pkg_name) {
+            // pacman.conf already owns this exclusion; do not duplicate it in APC's file.
+            None
+        } else if lock_version {
             let was_locked = self.locked_pkgs.contains(&pkg_name);
             match self.alpm.add_ignorepkg(pkg_name.as_str()) {
                 Ok(()) => {
@@ -1263,7 +1302,7 @@ impl App {
 
         for pkg in self.alpm.trans_add() {
             let name = pkg.name().to_string();
-            if self.locked_pkgs.contains(&name) {
+            if self.is_package_locked(&name) {
                 continue;
             }
 
@@ -1626,7 +1665,7 @@ fn draw_pane(
             let size_mib = pkg.size as f64 / (1024.0 * 1024.0);
 
             let row_text = if is_left_pane {
-                let lock_mark = if app.locked_pkgs.contains(&pkg.name) { "\u{f023} " } else { "  " };
+                let lock_mark = if app.is_package_locked(&pkg.name) { "\u{f023} " } else { "  " };
                 format!(
                     "{}{}{:<name_w$} {:<14} {:>7.2}M",
                     tag_mark,
@@ -1660,7 +1699,7 @@ fn draw_pane(
                         .fg(NC_YELLOW)
                         .add_modifier(Modifier::BOLD),
                 )
-            } else if is_left_pane && app.locked_pkgs.contains(&pkg.name) {
+            } else if is_left_pane && app.is_package_locked(&pkg.name) {
                 ListItem::new(row_text).style(
                     Style::default()
                         .fg(NC_YELLOW),
@@ -1761,8 +1800,12 @@ fn draw_bottom_bar(f: &mut Frame, area: Rect, active: ActivePane, app: &App) {
         return;
     }
 
-    let is_cur_locked = app.left.current_pkg().map(|p| app.locked_pkgs.contains(&p.name)).unwrap_or(false);
-    let lock_label = if is_cur_locked { "Unlock" } else { "Lock" };
+    let current_pkg = app.left.current_pkg();
+    let lock_label = match current_pkg {
+        Some(pkg) if app.pacman_conf_ignored_pkgs.contains(&pkg.name) => "Config",
+        Some(pkg) if app.locked_pkgs.contains(&pkg.name) => "Unlock",
+        _ => "Lock",
+    };
 
     let f_keys = match active {
         ActivePane::Left => {
@@ -2014,7 +2057,7 @@ fn draw_help_dialog(f: &mut Frame) {
         ("F1", "Show this Help table"),
         ("F2", "Reinstall selected package(s)"),
         ("F3", "Quick View package info in opposite pane"),
-        ("F4", "Lock / Unlock package version (\u{f023} via /etc/pacman.d/IgnorePkg)"),
+        ("F4", "Lock / Unlock APC-managed package versions; pacman.conf exclusions are untouched"),
         ("F5", "Downgrade from cache (Left) / Install (Right)"),
         ("F6", "Update system (ALPM equivalent of pacman -Syu)"),
         ("F8", "Remove packages safely (-Rns)"),
@@ -2596,6 +2639,33 @@ mod tests {
         assert!(combined.contains(SigLevel::DATABASE_OPTIONAL));
         assert!(!combined.contains(SigLevel::DATABASE));
     }
+    #[test]
+    fn pacman_conf_ignore_packages_are_parsed_separately() {
+        let configured = vec![
+            "linux linux-lts".to_string(),
+            "  mesa\n  systemd ".to_string(),
+        ];
+        let parsed = parse_package_names(&configured);
+        assert_eq!(
+            parsed,
+            ["linux", "linux-lts", "mesa", "systemd"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn managed_ignore_file_parser_reads_only_ignorepkg_entries() {
+        let parsed = parse_managed_ignore_pkg(
+            "# APC-managed locks\nIgnorePkg = linux mesa\nNoUpgrade = /etc/example\n",
+        );
+        assert_eq!(
+            parsed,
+            ["linux", "mesa"].into_iter().map(str::to_string).collect()
+        );
+    }
+
     #[test]
     fn repository_usage_parser_defaults_to_all_and_accepts_restrictions() {
         assert_eq!(parse_repo_usage(&[]).unwrap(), Usage::ALL);
