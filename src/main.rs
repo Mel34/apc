@@ -2521,10 +2521,21 @@ mod tests {
         assert!(parsed.contains(SigLevel::PACKAGE));
         assert!(!parsed.contains(SigLevel::DATABASE));
         assert!(parsed.contains(SigLevel::DATABASE_OPTIONAL));
+
+        let combined = parse_siglevel(
+            &["Required DatabaseOptional TrustedOnly".to_string()],
+            SigLevel::NONE,
+        ).unwrap();
+        assert!(combined.contains(SigLevel::PACKAGE));
+        assert!(combined.contains(SigLevel::DATABASE_OPTIONAL));
+        assert!(!combined.contains(SigLevel::DATABASE));
     }
     #[test]
     fn repository_usage_parser_defaults_to_all_and_accepts_restrictions() {
         assert_eq!(parse_repo_usage(&[]).unwrap(), Usage::ALL);
-        assert_eq!(parse_repo_usage(&["Sync".to_string(), "Install".to_string()]).unwrap(), Usage::SYNC | Usage::INSTALL);
+        assert_eq!(
+            parse_repo_usage(&["Sync Install".to_string()]).unwrap(),
+            Usage::SYNC | Usage::INSTALL
+        );
     }
 }
