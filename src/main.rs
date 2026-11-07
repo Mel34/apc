@@ -385,6 +385,17 @@ fn is_hold_package(name: &str, hold_pkgs: &[String]) -> bool {
     hold_pkgs.iter().any(|pattern| wildcard_matches(pattern, name))
 }
 
+fn package_matches_patterns(name: &str, patterns: &HashSet<String>) -> bool {
+    patterns.iter().any(|pattern| wildcard_matches(pattern, name))
+}
+
+fn is_managed_wildcard_lock(name: &str, patterns: &HashSet<String>) -> bool {
+    patterns.iter().any(|pattern| {
+        (pattern.contains('*') || pattern.contains('?'))
+            && wildcard_matches(pattern, name)
+    })
+}
+
 fn parse_package_names(values: &[String]) -> Vec<String> {
     values
         .iter()
@@ -691,11 +702,8 @@ impl App {
     }
 
     fn is_package_locked(&self, name: &str) -> bool {
-        self.locked_pkgs.contains(name)
-            || self
-                .pacman_conf_ignored_pkgs
-                .iter()
-                .any(|pattern| wildcard_matches(pattern, name))
+        package_matches_patterns(name, &self.locked_pkgs)
+            || package_matches_patterns(name, &self.pacman_conf_ignored_pkgs)
     }
 
     fn save_locked_packages(&self) -> Result<()> {
@@ -770,6 +778,19 @@ impl App {
             anyhow::bail!(
                 "Cannot change {}: excluded by pacman.conf; APC leaves those settings untouched",
                 externally_locked.join(", ")
+            );
+        }
+
+        let managed_wildcard_locked: Vec<&str> = targets
+            .iter()
+            .filter(|target| is_managed_wildcard_lock(target, &self.locked_pkgs))
+            .map(String::as_str)
+            .collect();
+        if !managed_wildcard_locked.is_empty() {
+            anyhow::bail!(
+                "Cannot change {}: covered by an APC-managed wildcard in {}; edit that pattern to change the lock",
+                managed_wildcard_locked.join(", "),
+                IGNORE_PKG_FILE
             );
         }
 
@@ -2717,6 +2738,27 @@ mod tests {
             parsed,
             ["linux", "mesa"].into_iter().map(str::to_string).collect()
         );
+    }
+
+    #[test]
+    fn managed_wildcard_patterns_lock_all_matching_packages() {
+        let managed = parse_managed_ignore_pkg(
+            "# APC-managed locks\nIgnorePkg = linux-firmware* bash\n",
+        );
+
+        for name in [
+            "linux-firmware-amdgpu",
+            "linux-firmware-intel",
+            "linux-firmware-realtek",
+            "linux-firmware-whence",
+        ] {
+            assert!(package_matches_patterns(name, &managed), "{name} should be locked");
+            assert!(is_managed_wildcard_lock(name, &managed), "{name} should be covered by the wildcard");
+        }
+
+        assert!(package_matches_patterns("bash", &managed));
+        assert!(!is_managed_wildcard_lock("bash", &managed));
+        assert!(!package_matches_patterns("linux", &managed));
     }
 
     #[test]
