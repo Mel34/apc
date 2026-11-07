@@ -311,7 +311,7 @@ fn parse_siglevel(tokens: &[String], mut level: SigLevel) -> Result<SigLevel> {
             _ => {}
         }
     }
-    for token in tokens {
+    for token in tokens.iter().flat_map(|value| value.split_whitespace()) {
         let value = token.to_ascii_lowercase();
         match value.as_str() {
             "required" | "optional" | "never" => {
@@ -351,7 +351,7 @@ fn parse_repo_usage(tokens: &[String]) -> Result<Usage> {
         return Ok(Usage::ALL);
     }
     let mut usage = Usage::NONE;
-    for token in tokens {
+    for token in tokens.iter().flat_map(|value| value.split_whitespace()) {
         match token.to_ascii_lowercase().as_str() {
             "sync" => usage.insert(Usage::SYNC),
             "search" => usage.insert(Usage::SEARCH),
@@ -490,16 +490,25 @@ impl App {
             if !cache_dirs.contains(cachedir) { cache_dirs.push(cachedir.clone()); }
         }
         for hook_dir in &pacconf.hook_dir { alpm.add_hookdir(hook_dir.as_str())?; }
-        for pattern in &pacconf.no_upgrade { alpm.add_noupgrade(pattern.as_str())?; }
-        for pattern in &pacconf.no_extract { alpm.add_noextract(pattern.as_str())?; }
-        for group in &pacconf.ignore_group { alpm.add_ignoregroup(group.as_str())?; }
+        for value in &pacconf.no_upgrade {
+            for pattern in value.split_whitespace() { alpm.add_noupgrade(pattern)?; }
+        }
+        for value in &pacconf.no_extract {
+            for pattern in value.split_whitespace() { alpm.add_noextract(pattern)?; }
+        }
+        for value in &pacconf.ignore_group {
+            for group in value.split_whitespace() { alpm.add_ignoregroup(group)?; }
+        }
 
-        let architectures: Vec<String> = if pacconf.architecture.is_empty()
-            || pacconf.architecture.iter().any(|arch| arch.eq_ignore_ascii_case("auto"))
+        let configured_architectures: Vec<String> = pacconf.architecture.iter()
+            .flat_map(|value| value.split_whitespace().map(str::to_string))
+            .collect();
+        let architectures: Vec<String> = if configured_architectures.is_empty()
+            || configured_architectures.iter().any(|arch| arch.eq_ignore_ascii_case("auto"))
         {
             vec![std::env::consts::ARCH.to_string()]
         } else {
-            pacconf.architecture.clone()
+            configured_architectures
         };
         for architecture in &architectures {
             alpm.add_architecture(architecture.as_str())?;
@@ -531,6 +540,9 @@ impl App {
 
         let locked_pkgs = Self::load_locked_packages(&pacconf.ignore_pkg);
         for pkg in &locked_pkgs { alpm.add_ignorepkg(pkg.as_str())?; }
+        let hold_pkgs: Vec<String> = pacconf.hold_pkg.iter()
+            .flat_map(|value| value.split_whitespace().map(str::to_string))
+            .collect();
 
         // Live In-TUI progress callback: record package progress and redraw the current dialog
         alpm.set_progress_cb((), move |progress, pkgname, percent, howmany, current, _| {
@@ -604,7 +616,7 @@ impl App {
             system_upgrade_in_progress: false,
             syncdbs_synced_without_upgrade,
             partial_upgrade_marker,
-            hold_pkgs: pacconf.hold_pkg.clone(),
+            hold_pkgs,
             should_quit: false,
         };
 
@@ -614,7 +626,9 @@ impl App {
     }
 
     fn load_locked_packages(configured: &[String]) -> HashSet<String> {
-        let mut locked: HashSet<String> = configured.iter().cloned().collect();
+        let mut locked: HashSet<String> = configured.iter()
+            .flat_map(|value| value.split_whitespace().map(str::to_string))
+            .collect();
         if let Ok(content) = fs::read_to_string(IGNORE_PKG_FILE) {
             for line in content.lines() {
                 let trimmed = line.trim();
