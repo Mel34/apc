@@ -486,8 +486,11 @@ impl App {
 
         let mut cache_dirs = Vec::new();
         for cachedir in &pacconf.cache_dir {
-            alpm.add_cachedir(cachedir.as_str())?;
-            if !cache_dirs.contains(cachedir) { cache_dirs.push(cachedir.clone()); }
+            let normalized = cachedir.trim_end_matches('/');
+            if !cache_dirs.iter().any(|existing: &String| existing.trim_end_matches('/') == normalized) {
+                alpm.add_cachedir(cachedir.as_str())?;
+                cache_dirs.push(cachedir.clone());
+            }
         }
         for hook_dir in &pacconf.hook_dir { alpm.add_hookdir(hook_dir.as_str())?; }
         for value in &pacconf.no_upgrade {
@@ -520,10 +523,11 @@ impl App {
                 let expanded = server.replace("$repo", &repo.name).replace("$arch", &arch);
                 if let Some(local_path) = expanded.strip_prefix("file://") {
                     let clean_path = local_path.trim_end_matches('/');
-                    if clean_path != "/var/cache/pacman/pkg" && Path::new(clean_path).is_dir() {
+                    let already_configured = cache_dirs.iter()
+                        .any(|existing| existing.trim_end_matches('/') == clean_path);
+                    if !already_configured && Path::new(clean_path).is_dir() {
                         alpm.add_cachedir(clean_path)?;
-                        let clean_string = clean_path.to_string();
-                        if !cache_dirs.contains(&clean_string) { cache_dirs.push(clean_string); }
+                        cache_dirs.push(clean_path.to_string());
                     }
                 }
             }
