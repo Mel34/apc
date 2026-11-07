@@ -297,14 +297,6 @@ enum Modal {
     Message(String),
 }
 
-struct RootGuard;
-
-impl RootGuard {
-    pub fn acquire() -> Result<Self> {
-        Ok(Self)
-    }
-}
-
 struct App {
     alpm: Alpm,
     active_pane: ActivePane,
@@ -789,21 +781,21 @@ impl App {
         lock_version: bool,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
-        check_and_clean_stale_lock();
+        check_database_lock(&self.alpm)?;
 
         let path_str = pkg_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid package path"))?;
         let pkg = self
             .alpm
-            .pkg_load(path_str, true, SigLevel::NONE)
+            .pkg_load(path_str, true, self.alpm.local_file_siglevel())
             .map_err(|e| anyhow::anyhow!("Failed to load cached archive: {e:?}"))?;
 
         let pkg_name = pkg.name().to_string();
 
         self.alpm.trans_init(TransFlag::empty())?;
-        self.alpm
-            .trans_add_pkg(pkg)
-            .map_err(|e| anyhow::anyhow!("Failed to queue package for downgrade: {e:?}"))?;
+        if let Err(err) = self.alpm.trans_add_pkg(pkg) {
+            let _ = self.alpm.trans_release();
+            anyhow::bail!("Failed to queue package for downgrade: {err:?}");
+        }
 
         let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
         if let Err(err_msg) = prep_res {
@@ -845,24 +837,13 @@ impl App {
         reinstall: bool,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
-        check_and_clean_stale_lock();
+        check_database_lock(&self.alpm)?;
 
-        // Purge stale archives from global cache to avoid checksum collisions
-        let pkg_cache = Path::new("/var/cache/pacman/pkg");
-        if let Ok(entries) = fs::read_dir(pkg_cache) {
-            let prefixes: Vec<String> = targets.iter().map(|t| format!("{t}-")).collect();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
-                        && prefixes.iter().any(|p| name.starts_with(p))
-                    {
-                        let _ = fs::remove_file(&path);
-                    }
-                }
-            }
+        if self.syncdbs_synced_without_upgrade {
+            anyhow::bail!("Package databases were synchronized separately. Run a full system upgrade (F6) before installing or reinstalling packages.");
         }
+
+        // Never delete package archives from configured caches during installation.
 
         let op_name = if reinstall { "Reinstalling Packages" } else { "Installing Packages" };
         let target_desc = targets.join(", ");
@@ -876,9 +857,10 @@ impl App {
             let mut found = false;
             for db in self.alpm.syncdbs() {
                 if let Ok(pkg) = db.pkg(name.as_str()) {
-                    self.alpm
-                        .trans_add_pkg(pkg)
-                        .map_err(|e| anyhow::anyhow!("Failed to add {name} to transaction: {e:?}"))?;
+                    if let Err(err) = self.alpm.trans_add_pkg(pkg) {
+                        let _ = self.alpm.trans_release();
+                        anyhow::bail!("Failed to add {name} to transaction: {err:?}");
+                    }
                     found = true;
                     break;
                 }
@@ -975,8 +957,7 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
-        check_and_clean_stale_lock();
+        check_database_lock(&self.alpm)?;
 
         self.update_progress(terminal, "System Upgrade", "Repositories", "Synchronizing mirror databases...", 20)?;
         let _ = self.alpm.syncdbs_mut().update(false);
@@ -1052,7 +1033,6 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
 
         self.system_upgrade_in_progress = true;
         terminal.draw(|f| {
@@ -1118,20 +1098,15 @@ impl App {
     }
 }
 
-fn check_and_clean_stale_lock() {
-    let lck_path = Path::new("/var/lib/pacman/db.lck");
-    if lck_path.exists() {
-        let is_running = std::process::Command::new("pgrep")
-            .arg("-x")
-            .arg("pacman")
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-
-        if !is_running {
-            let _ = fs::remove_file(lck_path);
-        }
+fn check_database_lock(alpm: &Alpm) -> Result<()> {
+    let lockfile = Path::new(alpm.lockfile());
+    if lockfile.exists() {
+        anyhow::bail!(
+            "The package database is locked by another package manager or an unfinished transaction: {}. Do not delete this lock automatically; verify that no package operation is running first.",
+            lockfile.display()
+        );
     }
+    Ok(())
 }
 
 fn flush_events() -> Result<()> {
@@ -1878,7 +1853,7 @@ fn main() -> Result<()> {
         std::process::exit(status.code().unwrap_or(0));
     }
 
-    check_and_clean_stale_lock();
+    check_database_lock(&self.alpm)?;
 
     let mut app = match App::new() {
         Ok(a) => a,
