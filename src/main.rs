@@ -70,6 +70,18 @@ struct SysUpdateInfo {
     total_download_size: i64,
 }
 
+fn update_list_window_start(cursor: usize, total_items: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        return 0;
+    }
+
+    cursor
+        .min(total_items.saturating_sub(1))
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(total_items.saturating_sub(visible_rows))
+}
+
 #[derive(Clone)]
 struct CachedVersionItem {
     path: std::path::PathBuf,
@@ -888,6 +900,7 @@ struct App {
     locked_pkgs: HashSet<String>,
     pacman_conf_ignored_pkgs: HashSet<String>,
     updates_view: Option<SysUpdateInfo>,
+    updates_cursor: usize,
     upgrade_selected_button: usize,
     downgrade_view: Option<DowngradeView>,
     cache_dirs: Vec<String>,
@@ -1172,6 +1185,7 @@ impl App {
             locked_pkgs,
             pacman_conf_ignored_pkgs,
             updates_view: None,
+            updates_cursor: 0,
             upgrade_selected_button: 0,
             downgrade_view: None,
             cache_dirs,
@@ -2021,6 +2035,7 @@ impl App {
             new_deps,
             total_download_size,
         });
+        self.updates_cursor = 0;
         self.upgrade_selected_button = 0;
 
         Ok(())
@@ -2302,21 +2317,36 @@ fn draw_pane(
                     Style::default().fg(NC_YELLOW).add_modifier(Modifier::BOLD),
                 ));
 
-            let visible_rows = (area.height.saturating_sub(3)) as usize;
+            let visible_rows = area.height.saturating_sub(3) as usize;
             let max_name_w = (area.width.saturating_sub(28) as usize).max(12);
 
             let header = format!("   {:<name_w$} {:<14} {:>7}", "Package", "New Version", "Size", name_w = max_name_w);
+            let selected_style = Style::default()
+                .fg(NC_BLACK)
+                .bg(NC_CYAN)
+                .add_modifier(Modifier::BOLD);
 
             let mut all_items = Vec::new();
-            for dep in &update_info.new_deps {
+            for (index, dep) in update_info.new_deps.iter().enumerate() {
                 let size_mib = dep.size as f64 / (1024.0 * 1024.0);
                 let row = format!("* [NEW] {:<name_w$} {:<14} {:>7.2}M", dep.name, dep.new_version, size_mib, name_w = max_name_w.saturating_sub(6));
-                all_items.push(ListItem::new(row).style(Style::default().fg(NC_CYAN).add_modifier(Modifier::BOLD)));
+                let style = if index == app.updates_cursor {
+                    selected_style
+                } else {
+                    Style::default().fg(NC_CYAN).add_modifier(Modifier::BOLD)
+                };
+                all_items.push(ListItem::new(row).style(style));
             }
-            for u in &update_info.updates {
-                let size_mib = u.size as f64 / (1024.0 * 1024.0);
-                let row = format!("        {:<name_w$} {:<14} {:>7.2}M", u.name, u.new_version, size_mib, name_w = max_name_w.saturating_sub(6));
-                all_items.push(ListItem::new(row).style(Style::default().fg(NC_WHITE)));
+            let update_offset = update_info.new_deps.len();
+            for (index, update) in update_info.updates.iter().enumerate() {
+                let size_mib = update.size as f64 / (1024.0 * 1024.0);
+                let row = format!("        {:<name_w$} {:<14} {:>7.2}M", update.name, update.new_version, size_mib, name_w = max_name_w.saturating_sub(6));
+                let style = if update_offset + index == app.updates_cursor {
+                    selected_style
+                } else {
+                    Style::default().fg(NC_WHITE)
+                };
+                all_items.push(ListItem::new(row).style(style));
             }
 
             f.render_widget(upd_block, area);
@@ -2326,10 +2356,18 @@ fn draw_pane(
                 f.render_widget(Paragraph::new(header).style(Style::default().fg(NC_CYAN).bg(NC_BLUE).add_modifier(Modifier::BOLD)), header_rect);
 
                 let list_rect = Rect { x: area.x + 1, y: area.y + 2, width: area.width.saturating_sub(2), height: area.height.saturating_sub(3) };
-                f.render_widget(List::new(all_items.into_iter().take(visible_rows).collect::<Vec<_>>()), list_rect);
+                let start = update_list_window_start(app.updates_cursor, all_items.len(), visible_rows);
+                let visible_items = all_items.into_iter().skip(start).take(visible_rows).collect::<Vec<_>>();
+                f.render_widget(List::new(visible_items), list_rect);
             }
 
-            let status = format!(" Total Download: {:.2} MiB ", update_info.total_download_size as f64 / (1024.0 * 1024.0));
+            let total_items = update_info.new_deps.len() + update_info.updates.len();
+            let position = if total_items == 0 {
+                "0/0".to_string()
+            } else {
+                format!("{}/{}", app.updates_cursor.min(total_items - 1) + 1, total_items)
+            };
+            let status = format!(" {position} | Total Download: {:.2} MiB ", update_info.total_download_size as f64 / (1024.0 * 1024.0));
             let status_rect = Rect { x: area.x + area.width.saturating_sub(status.len() as u16 + 2), y: area.y + area.height - 1, width: status.len() as u16, height: 1 };
             f.render_widget(Paragraph::new(status).style(Style::default().fg(NC_YELLOW).bg(NC_BLUE)), status_rect);
             return;
@@ -2960,6 +2998,29 @@ fn main() -> Result<()> {
             // System upgrade confirmation uses the status bar instead of a modal.
             if app.updates_view.is_some() {
                 match key.code {
+                    KeyCode::Up => {
+                        app.updates_cursor = app.updates_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        let count = app.updates_view.as_ref().map_or(0, |view| view.new_deps.len() + view.updates.len());
+                        if count > 0 {
+                            app.updates_cursor = (app.updates_cursor + 1).min(count - 1);
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        app.updates_cursor = app.updates_cursor.saturating_sub(15);
+                    }
+                    KeyCode::PageDown => {
+                        let count = app.updates_view.as_ref().map_or(0, |view| view.new_deps.len() + view.updates.len());
+                        if count > 0 {
+                            app.updates_cursor = (app.updates_cursor + 15).min(count - 1);
+                        }
+                    }
+                    KeyCode::Home => app.updates_cursor = 0,
+                    KeyCode::End => {
+                        let count = app.updates_view.as_ref().map_or(0, |view| view.new_deps.len() + view.updates.len());
+                        app.updates_cursor = count.saturating_sub(1);
+                    }
                     KeyCode::Left => app.upgrade_selected_button = 0,
                     KeyCode::Right => app.upgrade_selected_button = 1,
                     KeyCode::Enter => {
@@ -3320,6 +3381,16 @@ mod tests {
     fn summary(name: &str) -> PkgSummary {
         PkgSummary { name: name.to_string(), version: "1-1".to_string(), desc: String::new(), size: 1 }
     }
+    #[test]
+    fn update_list_window_keeps_cursor_visible_and_stays_in_bounds() {
+        assert_eq!(update_list_window_start(0, 30, 10), 0);
+        assert_eq!(update_list_window_start(9, 30, 10), 0);
+        assert_eq!(update_list_window_start(10, 30, 10), 1);
+        assert_eq!(update_list_window_start(29, 30, 10), 20);
+        assert_eq!(update_list_window_start(29, 30, 0), 0);
+        assert_eq!(update_list_window_start(0, 0, 10), 0);
+    }
+
     #[test]
     fn tagged_packages_remain_visible_under_filter() {
         let mut pane = PaneState::new(vec![summary("bash"), summary("linux"), summary("vim")]);
