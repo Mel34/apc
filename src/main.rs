@@ -431,13 +431,35 @@ struct App {
     progress: Option<ProgressState>,
     system_upgrade_in_progress: bool,
     syncdbs_synced_without_upgrade: bool,
+    partial_upgrade_marker: std::path::PathBuf,
     hold_pkgs: Vec<String>,
     should_quit: bool,
 }
 
 impl App {
+    fn mark_partial_upgrade_pending(&mut self) -> Result<()> {
+        fs::write(&self.partial_upgrade_marker, b"APC requires a full system upgrade after database synchronization.\n")?;
+        self.syncdbs_synced_without_upgrade = true;
+        Ok(())
+    }
+
+    fn clear_partial_upgrade_pending(&mut self) -> Result<()> {
+        match fs::remove_file(&self.partial_upgrade_marker) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                self.syncdbs_synced_without_upgrade = true;
+                return Err(err.into());
+            }
+        }
+        self.syncdbs_synced_without_upgrade = false;
+        Ok(())
+    }
+
     fn new() -> Result<Self> {
         let pacconf = pacmanconf::Config::new()?;
+        let partial_upgrade_marker = Path::new(&pacconf.db_path).join("apc-partial-upgrade-pending");
+        let syncdbs_synced_without_upgrade = partial_upgrade_marker.exists();
         let mut alpm = Alpm::new(pacconf.root_dir.as_str(), pacconf.db_path.as_str())?;
 
         let global_sig_level = parse_siglevel(
@@ -559,7 +581,8 @@ impl App {
             modal: None,
             progress: None,
             system_upgrade_in_progress: false,
-            syncdbs_synced_without_upgrade: false,
+            syncdbs_synced_without_upgrade,
+            partial_upgrade_marker,
             hold_pkgs: pacconf.hold_pkg.clone(),
             should_quit: false,
         };
@@ -1045,7 +1068,7 @@ impl App {
 
         check_database_lock(&self.alpm)?;
         self.update_progress(terminal, "Syncing Databases", "Core, Extra, Multilib", "Downloading repository databases...", 50)?;
-        self.syncdbs_synced_without_upgrade = true;
+        self.mark_partial_upgrade_pending()?;
         if let Err(err) = self.alpm.syncdbs_mut().update(false) {
             self.progress = None;
             anyhow::bail!("Repository database synchronization failed: {err:?}");
@@ -1069,7 +1092,7 @@ impl App {
         check_database_lock(&self.alpm)?;
 
         self.update_progress(terminal, "System Upgrade", "Repositories", "Synchronizing mirror databases...", 20)?;
-        self.syncdbs_synced_without_upgrade = true;
+        self.mark_partial_upgrade_pending()?;
         if let Err(err) = self.alpm.syncdbs_mut().update(false) {
             self.progress = None;
             anyhow::bail!("Repository database synchronization failed: {err:?}");
@@ -1127,8 +1150,8 @@ impl App {
         self.progress = None;
 
         if updates.is_empty() && new_deps.is_empty() {
-            self.syncdbs_synced_without_upgrade = false;
             let _ = self.alpm.trans_release();
+            self.clear_partial_upgrade_pending()?;
             self.modal = Some(Modal::Message("Your system is already up to date! No updates available.".to_string()));
             return Ok(());
         }
@@ -1177,7 +1200,7 @@ impl App {
         }
 
         self.alpm.trans_release()?;
-        self.syncdbs_synced_without_upgrade = false;
+        self.clear_partial_upgrade_pending()?;
         self.refresh_installed()?;
         self.refresh_available()?;
         self.updates_view = None;
