@@ -839,7 +839,7 @@ impl App {
         )?;
         if !wildcard_patterns_to_remove.is_empty() {
             let previous_locked = self.locked_pkgs.clone();
-            let mut removed_patterns = Vec::new();
+            let mut removed_patterns: Vec<String> = Vec::new();
 
             for pattern in &wildcard_patterns_to_remove {
                 if let Err(err) = self.alpm.remove_ignorepkg(pattern.as_str()).map(|_| ()) {
