@@ -1679,9 +1679,13 @@ impl App {
 
         self.update_progress(terminal, "Syncing Databases", "Core, Extra, Multilib", "Downloading repository databases...", 50)?;
         self.mark_partial_upgrade_pending()?;
-        if let Err(err) = self.alpm.syncdbs_mut().update(false) {
+        let update_result = Self::commit_in_tui(terminal, "Syncing Databases", || {
+            self.alpm.syncdbs_mut().update(false)
+                .map_err(|err| anyhow::anyhow!("Repository database synchronization failed: {err:?}"))
+        });
+        if let Err(err) = update_result {
             self.progress = None;
-            anyhow::bail!("Repository database synchronization failed: {err:?}");
+            return Err(err);
         }
 
         self.update_progress(terminal, "Syncing Databases", "Local Indices", "Refreshing package lists...", 85)?;
@@ -1705,9 +1709,13 @@ impl App {
 
         self.update_progress(terminal, "System Upgrade", "Repositories", "Synchronizing mirror databases...", 20)?;
         self.mark_partial_upgrade_pending()?;
-        if let Err(err) = self.alpm.syncdbs_mut().update(false) {
+        let update_result = Self::commit_in_tui(terminal, "System Upgrade", || {
+            self.alpm.syncdbs_mut().update(false)
+                .map_err(|err| anyhow::anyhow!("Repository database synchronization failed: {err:?}"))
+        });
+        if let Err(err) = update_result {
             self.progress = None;
-            anyhow::bail!("Repository database synchronization failed: {err:?}");
+            return Err(err);
         }
         if let Err(err) = self.refresh_available().and_then(|_| self.refresh_installed()) {
             self.progress = None;
