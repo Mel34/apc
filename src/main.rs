@@ -832,7 +832,7 @@ impl App {
         });
 
         // Report real package-download progress alongside package-operation progress.
-        alpm.set_dl_cb((), |filename, event: AnyDownloadEvent, _| {
+        alpm.set_dl_cb((), |filename, event: AnyDownloadEvent<'_>, _| {
             let mut state = PACKAGE_PROGRESS
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1796,6 +1796,7 @@ impl App {
             return Err(e);
         }
 
+        self.progress = None;
         self.alpm.trans_release()?;
         self.clear_partial_upgrade_pending()?;
         self.refresh_installed()?;
