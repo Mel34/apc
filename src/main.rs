@@ -961,6 +961,9 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
         check_database_lock(&self.alpm)?;
+        if self.syncdbs_synced_without_upgrade {
+            anyhow::bail!("Package databases were synchronized separately. Run a full system upgrade (F6) before downgrading packages.");
+        }
 
         let path_str = pkg_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid package path"))?;
         let pkg = self
