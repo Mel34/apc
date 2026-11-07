@@ -993,7 +993,7 @@ impl App {
                 Question::Replace(prompt) => prompt.set_replace(false),
                 Question::Conflict(mut prompt) => prompt.set_remove(false),
                 Question::Corrupted(mut prompt) => prompt.set_remove(false),
-                Question::RemovePkgs(mut prompt) => prompt.set_skip(true),
+                Question::RemovePkgs(mut prompt) => prompt.set_skip(false),
                 Question::SelectProvider(mut prompt) => prompt.set_index(-1),
                 Question::ImportKey(mut prompt) => prompt.set_import(false),
             }
@@ -1285,8 +1285,17 @@ impl App {
             .collect();
         let removal_names: HashSet<String> = removals.iter().map(|(name, _)| name.clone()).collect();
         if let Some(missing) = targets.iter().find(|name| !removal_names.contains(*name)) {
+            let dependents: Vec<String> = self.alpm.localdb().pkg(missing.as_str())
+                .map(|pkg| pkg.required_by().iter().map(|dependent| dependent.to_string()).collect())
+                .unwrap_or_default();
             let _ = self.alpm.trans_release();
-            anyhow::bail!("libalpm did not include selected package '{missing}' in the prepared removal transaction");
+            if dependents.is_empty() {
+                anyhow::bail!("libalpm did not include selected package '{missing}' in the prepared removal transaction");
+            }
+            anyhow::bail!(
+                "libalpm did not include selected package '{missing}' in the prepared removal transaction; installed dependents: {}",
+                dependents.join(", ")
+            );
         }
         let mut additional: Vec<String> = removals.iter()
             .map(|(name, _)| name.clone())
