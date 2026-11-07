@@ -235,6 +235,90 @@ struct DownloadProgressItem {
     percent: u16,
 }
 
+#[derive(Clone)]
+struct SystemUpgradePackageProgress {
+    name: String,
+    filename: Option<String>,
+    download_size: i64,
+    downloaded_bytes: i64,
+    download_complete: bool,
+    download_failed: bool,
+    install_percent: u16,
+    installed: bool,
+}
+
+impl SystemUpgradePackageProgress {
+    fn percent(&self) -> u16 {
+        if self.installed {
+            return 100;
+        }
+        if self.download_complete {
+            return 50 + self.install_percent.min(99) / 2;
+        }
+        if self.download_size <= 0 {
+            return 0;
+        }
+
+        let downloaded = self.downloaded_bytes.max(0).min(self.download_size);
+        (downloaded.saturating_mul(50) / self.download_size).min(49) as u16
+    }
+}
+
+fn system_upgrade_download_percent(packages: &[SystemUpgradePackageProgress]) -> u16 {
+    let total: i64 = packages.iter().map(|p| p.download_size.max(0)).sum();
+    if total == 0 {
+        return if system_upgrade_downloads_complete(packages) {
+            100
+        } else {
+            0
+        };
+    }
+
+    let downloaded: i64 = packages
+        .iter()
+        .map(|p| {
+            if p.download_complete {
+                p.download_size.max(0)
+            } else {
+                p.downloaded_bytes.max(0).min(p.download_size.max(0))
+            }
+        })
+        .sum();
+
+    let percent = (downloaded.saturating_mul(100) / total).min(100) as u16;
+    if system_upgrade_downloads_complete(packages) {
+        percent
+    } else {
+        percent.min(99)
+    }
+}
+
+fn system_upgrade_downloads_complete(packages: &[SystemUpgradePackageProgress]) -> bool {
+    packages
+        .iter()
+        .all(|p| p.download_complete && !p.download_failed)
+}
+
+fn system_upgrade_scroll_start(
+    active_index: Option<usize>,
+    total_items: usize,
+    visible_rows: usize,
+) -> usize {
+    if visible_rows == 0 || total_items <= visible_rows {
+        return 0;
+    }
+
+    let Some(active_index) = active_index else {
+        return 0;
+    };
+
+    active_index
+        .min(total_items - 1)
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(total_items - visible_rows)
+}
+
 #[derive(Clone, Default)]
 struct PackageProgressState {
     packages: Vec<PackageProgressItem>,
@@ -245,6 +329,12 @@ struct PackageProgressState {
     download_percent: u16,
     downloaded_bytes: i64,
     total_download_bytes: i64,
+    system_upgrade_fullscreen: bool,
+    system_upgrade_packages: Vec<SystemUpgradePackageProgress>,
+    system_upgrade_active_package: Option<String>,
+    system_upgrade_install_percent: u16,
+    system_upgrade_overall_percent: u16,
+    system_upgrade_status: String,
 }
 
 static PACKAGE_PROGRESS: std::sync::Mutex<PackageProgressState> =
@@ -257,6 +347,12 @@ static PACKAGE_PROGRESS: std::sync::Mutex<PackageProgressState> =
         download_percent: 0,
         downloaded_bytes: 0,
         total_download_bytes: 0,
+        system_upgrade_fullscreen: false,
+        system_upgrade_packages: Vec::new(),
+        system_upgrade_active_package: None,
+        system_upgrade_install_percent: 0,
+        system_upgrade_overall_percent: 0,
+        system_upgrade_status: String::new(),
     });
 
 static QUESTION_REFUSALS: std::sync::Mutex<Vec<String>> =
@@ -303,9 +399,6 @@ fn with_question_refusals(message: String) -> String {
 
 fn redraw_transaction_progress() {
     let background = BACKGROUND_BUFFER.with(|buffer| buffer.borrow().clone());
-    let Some(background) = background else {
-        return;
-    };
     let progress = ACTIVE_PROGRESS.with(|progress| progress.borrow().clone());
     let state = PACKAGE_PROGRESS
         .lock()
@@ -320,9 +413,13 @@ fn redraw_transaction_progress() {
 
         unsafe {
             let _ = (*terminal_ptr).draw(|frame| {
-                *frame.buffer_mut() = background.clone();
-                if let Some(progress) = progress.as_ref() {
-                    draw_progress_dialog(frame, progress, &state);
+                if state.system_upgrade_fullscreen {
+                    draw_system_upgrade_progress(frame, &state);
+                } else if let Some(background) = background.as_ref() {
+                    *frame.buffer_mut() = background.clone();
+                    if let Some(progress) = progress.as_ref() {
+                        draw_progress_dialog(frame, progress, &state);
+                    }
                 }
             });
         }
@@ -1049,26 +1146,49 @@ impl App {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-                if state.active_package.as_deref() != Some(pkgname) {
-                    if let Some(previous) = state.active_package.clone() {
-                        if let Some(item) = state.packages.iter_mut().find(|item| item.name == previous) {
-                            item.percent = 100;
+                if state.system_upgrade_fullscreen {
+                    state.system_upgrade_active_package = Some(pkgname.to_string());
+                    if let Some(item) = state
+                        .system_upgrade_packages
+                        .iter_mut()
+                        .find(|item| item.name == pkgname)
+                    {
+                        item.install_percent = percent.max(0).min(99) as u16;
+                    }
+                    state.system_upgrade_install_percent = overall.min(99);
+                    if system_upgrade_downloads_complete(&state.system_upgrade_packages) {
+                        state.system_upgrade_overall_percent =
+                            50 + state.system_upgrade_install_percent / 2;
+                        state.system_upgrade_status =
+                            format!("Installing packages — {pkgname}");
+                    } else {
+                        state.system_upgrade_overall_percent =
+                            system_upgrade_download_percent(&state.system_upgrade_packages) / 2;
+                        state.system_upgrade_status =
+                            format!("Waiting for downloads — {pkgname}");
+                    }
+                } else {
+                    if state.active_package.as_deref() != Some(pkgname) {
+                        if let Some(previous) = state.active_package.clone() {
+                            if let Some(item) = state.packages.iter_mut().find(|item| item.name == previous) {
+                                item.percent = 100;
+                            }
                         }
+
+                        if !state.packages.iter().any(|item| item.name == pkgname) {
+                            state.packages.push(PackageProgressItem {
+                                name: pkgname.to_string(),
+                                percent: 0,
+                            });
+                        }
+                        state.active_package = Some(pkgname.to_string());
                     }
 
-                    if !state.packages.iter().any(|item| item.name == pkgname) {
-                        state.packages.push(PackageProgressItem {
-                            name: pkgname.to_string(),
-                            percent: 0,
-                        });
+                    if let Some(item) = state.packages.iter_mut().find(|item| item.name == pkgname) {
+                        item.percent = percent.max(0).min(100) as u16;
                     }
-                    state.active_package = Some(pkgname.to_string());
+                    state.overall_percent = overall;
                 }
-
-                if let Some(item) = state.packages.iter_mut().find(|item| item.name == pkgname) {
-                    item.percent = percent.max(0).min(100) as u16;
-                }
-                state.overall_percent = overall;
             }
 
             redraw_transaction_progress();
@@ -1148,8 +1268,98 @@ impl App {
             } else {
                 0
             };
+
+            if state.system_upgrade_fullscreen {
+                if let Some(index) = state
+                    .system_upgrade_packages
+                    .iter()
+                    .position(|package| package.filename.as_deref() == Some(filename))
+                {
+                    state.system_upgrade_active_package =
+                        Some(state.system_upgrade_packages[index].name.clone());
+
+                    let package = &mut state.system_upgrade_packages[index];
+                    match event.event() {
+                        DownloadEvent::Init(_) => {
+                            package.downloaded_bytes = 0;
+                            package.download_complete = false;
+                            package.download_failed = false;
+                        }
+                        DownloadEvent::Progress(progress) => {
+                            package.downloaded_bytes = progress.downloaded.max(0);
+                        }
+                        DownloadEvent::Completed(completed) => {
+                            if matches!(
+                                completed.result,
+                                DownloadResult::Success | DownloadResult::UpToDate
+                            ) {
+                                package.downloaded_bytes = package.download_size.max(0);
+                                package.download_complete = true;
+                                package.download_failed = false;
+                            } else {
+                                package.download_failed = true;
+                                package.download_complete = false;
+                            }
+                        }
+                        DownloadEvent::Retry(retry) => {
+                            if !retry.resume {
+                                package.downloaded_bytes = 0;
+                            }
+                            package.download_complete = false;
+                            package.download_failed = false;
+                        }
+                    }
+                }
+
+                if system_upgrade_downloads_complete(&state.system_upgrade_packages) {
+                    state.system_upgrade_overall_percent =
+                        50 + state.system_upgrade_install_percent / 2;
+                    state.system_upgrade_status = "Installing packages...".to_string();
+                } else {
+                    state.system_upgrade_overall_percent =
+                        system_upgrade_download_percent(&state.system_upgrade_packages) / 2;
+                    if state.system_upgrade_packages.iter().any(|p| p.download_failed) {
+                        state.system_upgrade_status = "A package download failed".to_string();
+                    } else {
+                        state.system_upgrade_status =
+                            format!("Downloading {filename}...");
+                    }
+                }
+            }
+
             drop(state);
             redraw_transaction_progress();
+        });
+
+        alpm.set_event_cb((), |event, _| {
+            if let alpm::Event::PackageOperationDone(operation) = event.event() {
+                let package_name = match operation.operation() {
+                    alpm::PackageOperation::Install(package) => package.name(),
+                    alpm::PackageOperation::Upgrade(package, _) => package.name(),
+                    alpm::PackageOperation::Reinstall(package, _) => package.name(),
+                    alpm::PackageOperation::Downgrade(package, _) => package.name(),
+                    alpm::PackageOperation::Remove(_) => return,
+                };
+
+                let mut state = PACKAGE_PROGRESS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+                if state.system_upgrade_fullscreen {
+                    if let Some(package) = state
+                        .system_upgrade_packages
+                        .iter_mut()
+                        .find(|package| package.name == package_name)
+                    {
+                        package.installed = true;
+                        package.install_percent = 100;
+                    }
+                    state.system_upgrade_active_package = Some(package_name.to_string());
+                    state.system_upgrade_status = format!("Installed {package_name}");
+                    drop(state);
+                    redraw_transaction_progress();
+                }
+            }
         });
 
         // Register ALPM log callback
@@ -2032,11 +2242,48 @@ impl App {
     ) -> Result<()> {
 
         self.system_upgrade_in_progress = true;
+        {
+            let packages = self
+                .alpm
+                .trans_add()
+                .into_iter()
+                .filter(|pkg| !self.is_package_locked(pkg.name()))
+                .map(|pkg| {
+                    let download_size = pkg.download_size().max(0);
+                    let filename = pkg.filename().map(str::to_string);
+                    let cached = filename.as_deref().map_or(false, |filename| {
+                        self.cache_dirs.iter().any(|directory| {
+                            Path::new(directory).join(filename).is_file()
+                        })
+                    });
+                    SystemUpgradePackageProgress {
+                        name: pkg.name().to_string(),
+                        filename,
+                        download_size,
+                        downloaded_bytes: 0,
+                        download_complete: download_size == 0 || cached,
+                        download_failed: false,
+                        install_percent: 0,
+                        installed: false,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut state = PACKAGE_PROGRESS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *state = PackageProgressState::default();
+            state.system_upgrade_fullscreen = true;
+            state.system_upgrade_packages = packages;
+            state.system_upgrade_overall_percent = 0;
+            state.system_upgrade_status = "Starting system upgrade...".to_string();
+        }
+
         let progress = ProgressState {
             title: "System Upgrade".to_string(),
             target: "Selected system upgrade".to_string(),
-            step: "Committing the prepared package transaction...".to_string(),
-            percent: 50,
+            step: "Preparing package downloads...".to_string(),
+            percent: 0,
         };
         self.progress = Some(progress.clone());
         ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some(progress));
@@ -2055,9 +2302,27 @@ impl App {
         }
 
         let commit_result = Self::commit_in_tui(terminal, "System Upgrade", || {
-            self.alpm
+            let result = self.alpm
                 .trans_commit()
-                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("System upgrade commit failed: {err:?}"))))
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("System upgrade commit failed: {err:?}"))));
+
+            if result.is_ok() {
+                let mut state = PACKAGE_PROGRESS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for package in &mut state.system_upgrade_packages {
+                    package.download_complete = true;
+                    package.download_failed = false;
+                    package.installed = true;
+                    package.install_percent = 100;
+                }
+                state.system_upgrade_overall_percent = 100;
+                state.system_upgrade_status = "System upgrade completed successfully".to_string();
+                drop(state);
+                redraw_transaction_progress();
+            }
+
+            result
         });
         self.system_upgrade_in_progress = false;
 
@@ -2868,7 +3133,137 @@ fn draw_message_dialog(f: &mut Frame, msg: &str) {
     f.render_widget(p, dialog_rect);
 }
 
+fn draw_system_upgrade_progress(f: &mut Frame, state: &PackageProgressState) {
+    let area = f.area();
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NC_CYAN))
+        .style(Style::default().bg(NC_BLUE).fg(NC_WHITE))
+        .title(Span::styled(
+            " [ Arch Package Commander: System Upgrade ] ",
+            Style::default().fg(NC_YELLOW).add_modifier(Modifier::BOLD),
+        ));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let overall = state.system_upgrade_overall_percent.min(100);
+    let bar_width = sections[0].width.saturating_sub(8) as usize;
+    let filled = (overall as usize * bar_width / 100).min(bar_width);
+    let bar = format!(
+        "[{}{}] {}%",
+        "█".repeat(filled),
+        "░".repeat(bar_width.saturating_sub(filled)),
+        overall
+    );
+    let overall_text = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Overall system upgrade",
+            Style::default().fg(NC_WHITE).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            bar,
+            Style::default().fg(NC_CYAN).add_modifier(Modifier::BOLD),
+        )),
+    ]);
+    f.render_widget(overall_text, sections[0]);
+
+    let visible_rows = sections[1].height as usize;
+    let active_index = state.system_upgrade_active_package.as_ref().and_then(|active| {
+        state
+            .system_upgrade_packages
+            .iter()
+            .position(|package| &package.name == active)
+    });
+    let start = system_upgrade_scroll_start(
+        active_index,
+        state.system_upgrade_packages.len(),
+        visible_rows,
+    );
+    let end = start
+        .saturating_add(visible_rows)
+        .min(state.system_upgrade_packages.len());
+
+    for (row, package) in state.system_upgrade_packages[start..end].iter().enumerate() {
+        let row_area = Rect {
+            x: sections[1].x,
+            y: sections[1].y.saturating_add(row as u16),
+            width: sections[1].width,
+            height: 1,
+        };
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(row_area);
+
+        let active = active_index == Some(start + row);
+        let name_style = if package.download_failed {
+            Style::default().fg(Color::Red)
+        } else if active {
+            Style::default().fg(NC_YELLOW).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(NC_WHITE)
+        };
+        f.render_widget(
+            Paragraph::new(package.name.as_str()).style(name_style),
+            columns[0],
+        );
+
+        let percent = package.percent();
+        let width = columns[1].width.saturating_sub(8) as usize;
+        let filled = (percent as usize * width / 100).min(width);
+        let bar = format!(
+            "[{}{}] {:>3}%",
+            "█".repeat(filled),
+            "░".repeat(width.saturating_sub(filled)),
+            percent
+        );
+        let bar_style = if package.download_failed {
+            Style::default().fg(Color::Red)
+        } else if package.installed {
+            Style::default().fg(NC_CYAN)
+        } else {
+            Style::default().fg(NC_WHITE)
+        };
+        f.render_widget(Paragraph::new(bar).style(bar_style), columns[1]);
+    }
+
+    let status = Paragraph::new(vec![
+        Line::from(Span::styled(
+            &state.system_upgrade_status,
+            Style::default().fg(NC_YELLOW),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Packages: {}    Active: {}",
+                state.system_upgrade_packages.len(),
+                state.system_upgrade_active_package.as_deref().unwrap_or("—")
+            ),
+            Style::default().fg(NC_WHITE),
+        )),
+    ]);
+    f.render_widget(status, sections[2]);
+}
+
 fn draw_ui(f: &mut Frame, app: &App) {
+    if app.system_upgrade_in_progress {
+        let state = PACKAGE_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        draw_system_upgrade_progress(f, &state);
+        return;
+    }
+
     let size = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -3320,6 +3715,159 @@ mod tests {
     fn summary(name: &str) -> PkgSummary {
         PkgSummary { name: name.to_string(), version: "1-1".to_string(), desc: String::new(), size: 1 }
     }
+
+    fn upgrade_package(name: &str, download_size: i64) -> SystemUpgradePackageProgress {
+        SystemUpgradePackageProgress {
+            name: name.to_string(),
+            filename: Some(format!("{name}.pkg.tar.zst")),
+            download_size,
+            downloaded_bytes: 0,
+            download_complete: false,
+            download_failed: false,
+            install_percent: 0,
+            installed: false,
+        }
+    }
+
+    #[test]
+    fn system_upgrade_package_progress_tracks_download_and_install_phases() {
+        let mut package = upgrade_package("example", 100);
+
+        assert_eq!(package.percent(), 0);
+
+        package.downloaded_bytes = 25;
+        assert_eq!(package.percent(), 12);
+
+        package.downloaded_bytes = 100;
+        assert_eq!(package.percent(), 49);
+
+        package.download_complete = true;
+        assert_eq!(package.percent(), 50);
+
+        package.install_percent = 50;
+        assert_eq!(package.percent(), 75);
+
+        package.install_percent = 99;
+        assert_eq!(package.percent(), 99);
+
+        package.install_percent = 100;
+        assert_eq!(package.percent(), 99);
+
+        package.installed = true;
+        assert_eq!(package.percent(), 100);
+    }
+
+    #[test]
+    fn system_upgrade_package_progress_clamps_download_bytes() {
+        let mut package = upgrade_package("example", 100);
+
+        package.downloaded_bytes = -50;
+        assert_eq!(package.percent(), 0);
+
+        package.downloaded_bytes = 150;
+        assert_eq!(package.percent(), 49);
+    }
+
+    #[test]
+    fn system_upgrade_download_progress_is_weighted_by_package_size() {
+        let mut small = upgrade_package("small", 100);
+        let mut large = upgrade_package("large", 300);
+
+        small.downloaded_bytes = 50;
+        large.downloaded_bytes = 150;
+        assert_eq!(
+            system_upgrade_download_percent(&[small.clone(), large.clone()]),
+            50
+        );
+
+        small.download_complete = true;
+        assert_eq!(system_upgrade_download_percent(&[small, large]), 62);
+    }
+
+    #[test]
+    fn system_upgrade_cached_packages_count_as_downloaded() {
+        let mut cached = upgrade_package("cached", 200);
+        cached.download_complete = true;
+
+        assert_eq!(cached.percent(), 50);
+        assert_eq!(system_upgrade_download_percent(&[cached.clone()]), 100);
+        assert!(system_upgrade_downloads_complete(&[cached]));
+    }
+
+    #[test]
+    fn system_upgrade_zero_download_size_is_already_downloaded() {
+        let mut package = upgrade_package("local", 0);
+        package.download_complete = true;
+
+        assert_eq!(package.percent(), 50);
+        assert_eq!(system_upgrade_download_percent(&[package.clone()]), 100);
+        assert!(system_upgrade_downloads_complete(&[package]));
+    }
+
+    #[test]
+    fn system_upgrade_failed_download_does_not_complete_download_phase() {
+        let mut package = upgrade_package("failed", 100);
+        package.downloaded_bytes = 100;
+        package.download_failed = true;
+
+        assert!(!system_upgrade_downloads_complete(&[package.clone()]));
+        assert_eq!(package.percent(), 49);
+        assert_eq!(system_upgrade_download_percent(&[package.clone()]), 99);
+
+        package.download_complete = true;
+        assert!(!system_upgrade_downloads_complete(&[package]));
+    }
+
+    #[test]
+    fn system_upgrade_download_progress_waits_for_completion_event() {
+        let mut package = upgrade_package("example", 100);
+        package.downloaded_bytes = 100;
+
+        assert_eq!(package.percent(), 49);
+        assert_eq!(system_upgrade_download_percent(&[package.clone()]), 99);
+        assert!(!system_upgrade_downloads_complete(&[package.clone()]));
+
+        package.download_complete = true;
+
+        assert_eq!(package.percent(), 50);
+        assert_eq!(system_upgrade_download_percent(&[package.clone()]), 100);
+        assert!(system_upgrade_downloads_complete(&[package]));
+    }
+
+    #[test]
+    fn system_upgrade_downloads_require_every_package_to_complete() {
+        let mut first = upgrade_package("first", 100);
+        let second = upgrade_package("second", 200);
+        first.download_complete = true;
+
+        assert!(!system_upgrade_downloads_complete(&[first.clone(), second.clone()]));
+
+        let mut second = second;
+        second.download_complete = true;
+        assert!(system_upgrade_downloads_complete(&[first, second]));
+        assert!(system_upgrade_downloads_complete(&[]));
+    }
+
+    #[test]
+    fn system_upgrade_scroll_keeps_active_package_visible() {
+        let total = 12;
+        let visible = 5;
+
+        assert_eq!(system_upgrade_scroll_start(None, total, visible), 0);
+        assert_eq!(system_upgrade_scroll_start(Some(0), total, visible), 0);
+        assert_eq!(system_upgrade_scroll_start(Some(4), total, visible), 0);
+        assert_eq!(system_upgrade_scroll_start(Some(5), total, visible), 1);
+        assert_eq!(system_upgrade_scroll_start(Some(11), total, visible), 7);
+        assert_eq!(system_upgrade_scroll_start(Some(99), total, visible), 7);
+    }
+
+    #[test]
+    fn system_upgrade_scroll_handles_empty_and_fully_visible_lists() {
+        assert_eq!(system_upgrade_scroll_start(Some(0), 0, 5), 0);
+        assert_eq!(system_upgrade_scroll_start(Some(3), 4, 5), 0);
+        assert_eq!(system_upgrade_scroll_start(Some(3), 10, 0), 0);
+    }
+
     #[test]
     fn tagged_packages_remain_visible_under_filter() {
         let mut pane = PaneState::new(vec![summary("bash"), summary("linux"), summary("vim")]);
