@@ -1642,12 +1642,12 @@ impl App {
                             );
                             if let Err(rollback_err) = file_rollback {
                                 message.push_str(&format!(
-                                    "\\nFailed to restore the previous managed IgnorePkg file: {rollback_err}"
+                                    "\nFailed to restore the previous managed IgnorePkg file: {rollback_err}"
                                 ));
                             }
                             if let Err(rollback_err) = alpm_rollback {
                                 message.push_str(&format!(
-                                    "\\nFailed to restore libalpm's previous IgnorePkg list: {rollback_err}"
+                                    "\nFailed to restore libalpm's previous IgnorePkg list: {rollback_err}"
                                 ));
                             }
                             Some(message)
@@ -3370,6 +3370,43 @@ mod tests {
 
         assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(fs::read_to_string(&target).unwrap(), "IgnorePkg = new\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_file_replacement_failure_preserves_target_and_cleans_temporary_file() {
+        let root = std::env::temp_dir().join(format!("apc-atomic-failure-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target-dir");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), "original").unwrap();
+
+        assert!(atomic_replace_file(&target, b"replacement").is_err());
+        assert!(target.is_dir());
+        assert_eq!(fs::read_to_string(target.join("keep")).unwrap(), "original");
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.contains(".apc-") && name.ends_with(".tmp")
+        }));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_file_replacement_rejects_dangling_symlink_without_removing_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("apc-atomic-dangling-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let link = root.join("IgnorePkg");
+        symlink(root.join("missing-target"), &link).unwrap();
+
+        assert!(atomic_replace_file(&link, b"replacement").is_err());
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(!root.join("missing-target").exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 
