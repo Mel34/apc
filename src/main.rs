@@ -396,6 +396,57 @@ fn is_managed_wildcard_lock(name: &str, patterns: &HashSet<String>) -> bool {
     })
 }
 
+fn managed_wildcard_patterns_to_remove(
+    targets: &[String],
+    installed: &[PkgSummary],
+    patterns: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let selected: HashSet<&str> = targets.iter().map(String::as_str).collect();
+    let mut to_remove = HashSet::new();
+
+    for pattern in patterns
+        .iter()
+        .filter(|pattern| pattern.contains('*') || pattern.contains('?'))
+    {
+        let matches: HashSet<&str> = installed
+            .iter()
+            .filter(|pkg| wildcard_matches(pattern, &pkg.name))
+            .map(|pkg| pkg.name.as_str())
+            .collect();
+
+        if matches.iter().any(|name| selected.contains(name)) {
+            let missing: Vec<&str> = matches.difference(&selected).copied().collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "Cannot unlock wildcard '{pattern}': select all matching installed packages ({})",
+                    missing.join(", ")
+                );
+            }
+            to_remove.insert(pattern.clone());
+        }
+    }
+
+    if !to_remove.is_empty() {
+        let uncovered: Vec<&str> = targets
+            .iter()
+            .map(String::as_str)
+            .filter(|name| {
+                !to_remove
+                    .iter()
+                    .any(|pattern| wildcard_matches(pattern, name))
+            })
+            .collect();
+        if !uncovered.is_empty() {
+            anyhow::bail!(
+                "Cannot mix wildcard unlocks with other package locks; selection also contains {}",
+                uncovered.join(", ")
+            );
+        }
+    }
+
+    Ok(to_remove)
+}
+
 fn parse_package_names(values: &[String]) -> Vec<String> {
     values
         .iter()
@@ -779,6 +830,41 @@ impl App {
                 "Cannot change {}: excluded by pacman.conf; APC leaves those settings untouched",
                 externally_locked.join(", ")
             );
+        }
+
+        let wildcard_patterns_to_remove = managed_wildcard_patterns_to_remove(
+            &targets,
+            &self.left.all_items,
+            &self.locked_pkgs,
+        )?;
+        if !wildcard_patterns_to_remove.is_empty() {
+            let previous_locked = self.locked_pkgs.clone();
+            let mut removed_patterns = Vec::new();
+
+            for pattern in &wildcard_patterns_to_remove {
+                if let Err(err) = self.alpm.remove_ignorepkg(pattern.as_str()).map(|_| ()) {
+                    for removed in &removed_patterns {
+                        let _ = self.alpm.add_ignorepkg(removed.as_str());
+                    }
+                    return Err(err.into());
+                }
+                removed_patterns.push(pattern.clone());
+            }
+
+            for pattern in &wildcard_patterns_to_remove {
+                self.locked_pkgs.remove(pattern);
+            }
+
+            if let Err(err) = self.save_locked_packages() {
+                for pattern in &removed_patterns {
+                    let _ = self.alpm.add_ignorepkg(pattern.as_str());
+                }
+                self.locked_pkgs = previous_locked;
+                return Err(err);
+            }
+
+            self.left.tagged.clear();
+            return Ok(());
         }
 
         let managed_wildcard_locked: Vec<&str> = targets
@@ -2759,6 +2845,54 @@ mod tests {
         assert!(package_matches_patterns("bash", &managed));
         assert!(!is_managed_wildcard_lock("bash", &managed));
         assert!(!package_matches_patterns("linux", &managed));
+    }
+
+    #[test]
+    fn wildcard_unlock_requires_every_matching_installed_package() {
+        let installed = vec![
+            summary("linux-firmware-amdgpu"),
+            summary("linux-firmware-intel"),
+            summary("linux-firmware-realtek"),
+            summary("linux-firmware-whence"),
+            summary("bash"),
+        ];
+        let patterns: HashSet<String> = ["linux-firmware*".to_string()].into_iter().collect();
+        let all_targets: Vec<String> = installed[..4].iter().map(|pkg| pkg.name.clone()).collect();
+
+        assert_eq!(
+            managed_wildcard_patterns_to_remove(&all_targets, &installed, &patterns).unwrap(),
+            patterns
+        );
+
+        for selected_count in [1, 3] {
+            let partial: Vec<String> = installed[..selected_count]
+                .iter()
+                .map(|pkg| pkg.name.clone())
+                .collect();
+            assert!(
+                managed_wildcard_patterns_to_remove(&partial, &installed, &patterns).is_err(),
+                "selecting {selected_count} of four packages must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_unlock_rejects_mixed_selection() {
+        let installed = vec![
+            summary("linux-firmware-amdgpu"),
+            summary("linux-firmware-intel"),
+            summary("bash"),
+        ];
+        let patterns: HashSet<String> = ["linux-firmware*".to_string()].into_iter().collect();
+        let mixed = vec![
+            "linux-firmware-amdgpu".to_string(),
+            "linux-firmware-intel".to_string(),
+            "bash".to_string(),
+        ];
+
+        assert!(
+            managed_wildcard_patterns_to_remove(&mixed, &installed, &patterns).is_err()
+        );
     }
 
     #[test]
