@@ -454,17 +454,124 @@ fn parse_package_names(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn expand_include_pattern(pattern: &str, config_path: &Path) -> Vec<std::path::PathBuf> {
+    let include_path = Path::new(pattern);
+    let include_path = if include_path.is_absolute() {
+        include_path.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(include_path)
+    };
+
+    let mut candidates = Vec::new();
+    for component in include_path.components() {
+        match component {
+            std::path::Component::RootDir => candidates = vec![std::path::PathBuf::from("/")],
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                for candidate in &mut candidates {
+                    candidate.push("..");
+                }
+            }
+            std::path::Component::Normal(name) => {
+                let name = name.to_string_lossy();
+                if name.contains('*') || name.contains('?') {
+                    let mut matches = Vec::new();
+                    for parent in &candidates {
+                        if let Ok(entries) = fs::read_dir(parent) {
+                            for entry in entries.flatten() {
+                                if wildcard_matches(&name, &entry.file_name().to_string_lossy()) {
+                                    matches.push(entry.path());
+                                }
+                            }
+                        }
+                    }
+                    candidates = matches;
+                } else {
+                    for candidate in &mut candidates {
+                        candidate.push(name.as_ref());
+                    }
+                }
+            }
+            std::path::Component::Prefix(_) => {}
+        }
+    }
+    candidates
+}
+
+fn config_includes_file(
+    config_path: &Path,
+    target_path: &Path,
+    visited: &mut HashSet<std::path::PathBuf>,
+) -> bool {
+    let config_path = fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    if !visited.insert(config_path.clone()) {
+        return false;
+    }
+
+    let Ok(content) = fs::read_to_string(&config_path) else {
+        return false;
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("Include") {
+            continue;
+        }
+
+        let pattern = value
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        for included_path in expand_include_pattern(pattern, &config_path) {
+            let resolved = fs::canonicalize(&included_path)
+                .unwrap_or_else(|_| included_path.clone());
+            if resolved == target_path {
+                return true;
+            }
+            if included_path.is_file()
+                && config_includes_file(&included_path, target_path, visited)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn pacman_config_includes_managed_ignore_file() -> bool {
+    let config_path = Path::new("/etc/pacman.conf");
+    let target_path = Path::new(IGNORE_PKG_FILE);
+    let Ok(target_path) = fs::canonicalize(target_path) else {
+        return false;
+    };
+    config_includes_file(config_path, &target_path, &mut HashSet::new())
+}
+
 fn parse_external_ignore_packages(
     configured: &[String],
     managed: &HashSet<String>,
+    managed_file_included: bool,
 ) -> HashSet<String> {
-    // pacmanconf expands Include directives but preserves each IgnorePkg directive.
-    // Subtract one occurrence of each APC-managed package so duplicate external
-    // exclusions remain protected when the same package is also in pacman.conf.
+    // pacmanconf expands Include directives and loses their source-file provenance.
+    // Only subtract APC-managed entries when the managed file is in the Include chain.
     let mut packages = parse_package_names(configured);
-    for managed_pkg in managed {
-        if let Some(index) = packages.iter().position(|pkg| pkg == managed_pkg) {
-            packages.remove(index);
+    if managed_file_included {
+        for managed_pkg in managed {
+            if let Some(index) = packages.iter().position(|pkg| pkg == managed_pkg) {
+                packages.remove(index);
+            }
         }
     }
     packages.into_iter().collect()
@@ -648,8 +755,11 @@ impl App {
         }
 
         let mut locked_pkgs = Self::load_locked_packages();
-        let pacman_conf_ignored_pkgs =
-            parse_external_ignore_packages(&pacconf.ignore_pkg, &locked_pkgs);
+        let pacman_conf_ignored_pkgs = parse_external_ignore_packages(
+            &pacconf.ignore_pkg,
+            &locked_pkgs,
+            pacman_config_includes_managed_ignore_file(),
+        );
         // If a package is also excluded outside APC's managed file, external
         // configuration takes ownership and APC must not offer to unlock it.
         locked_pkgs.retain(|pkg| {
@@ -2815,7 +2925,7 @@ mod tests {
             .map(str::to_string)
             .collect();
 
-        let external = parse_external_ignore_packages(&configured, &managed);
+        let external = parse_external_ignore_packages(&configured, &managed, true);
         assert_eq!(
             external,
             ["linux", "linux-lts", "systemd"]
@@ -2824,6 +2934,55 @@ mod tests {
                 .collect()
         );
         assert!(external.iter().any(|pattern| wildcard_matches(pattern, "linux")));
+    }
+
+    #[test]
+    fn external_ignore_packages_remain_external_when_managed_file_is_not_included() {
+        let configured = vec!["linux linux-lts".to_string()];
+        let managed: HashSet<String> = ["linux"].into_iter().map(str::to_string).collect();
+
+        assert_eq!(
+            parse_external_ignore_packages(&configured, &managed, false),
+            ["linux", "linux-lts"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn managed_ignore_file_include_detection_handles_globs_and_nested_includes() {
+        let root = std::env::temp_dir().join(format!("apc-include-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("conf.d")).unwrap();
+        fs::write(root.join("IgnorePkg"), "IgnorePkg = linux\n").unwrap();
+        fs::write(
+            root.join("pacman.conf"),
+            "[options]\nInclude = conf.d/*.conf\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("conf.d/managed.conf"),
+            "Include = ../IgnorePkg\n",
+        )
+        .unwrap();
+
+        assert!(config_includes_file(
+            &root.join("pacman.conf"),
+            &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
+            &mut HashSet::new(),
+        ));
+
+        fs::write(
+            root.join("pacman.conf"),
+            "[options]\nInclude = conf.d/other.conf\n",
+        )
+        .unwrap();
+        fs::write(root.join("conf.d/other.conf"), "Color\n").unwrap();
+        assert!(!config_includes_file(
+            &root.join("pacman.conf"),
+            &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
+            &mut HashSet::new(),
+        ));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
