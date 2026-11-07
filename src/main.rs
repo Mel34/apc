@@ -1,7 +1,7 @@
-use alpm::{Alpm, SigLevel, TransFlag};
+use alpm::{Alpm, AnyDownloadEvent, DownloadEvent, DownloadResult, Question, SigLevel, TransFlag, Usage};
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -20,6 +20,10 @@ use std::{
     collections::HashSet,
     fs,
     io::{self, Write},
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::AsRawFd,
+    },
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -90,6 +94,8 @@ enum ActivePane {
 
 struct PaneState {
     all_items: Vec<PkgSummary>,
+    explicit_names: HashSet<String>,
+    show_all_items: bool,
     cursor: usize,
     filter: String,
     tagged: HashSet<String>,
@@ -99,22 +105,47 @@ impl PaneState {
     fn new(items: Vec<PkgSummary>) -> Self {
         Self {
             all_items: items,
+            explicit_names: HashSet::new(),
+            show_all_items: true,
             cursor: 0,
             filter: String::new(),
             tagged: HashSet::new(),
         }
     }
 
-    fn filtered(&self) -> Vec<&PkgSummary> {
-        if self.filter.is_empty() {
-            self.all_items.iter().collect()
-        } else {
-            let f = self.filter.to_lowercase();
-            self.all_items
-                .iter()
-                .filter(|p| p.name.to_lowercase().contains(&f))
-                .collect()
+    fn new_installed(items: Vec<PkgSummary>) -> Self {
+        let mut pane = Self::new(items);
+        pane.show_all_items = false;
+        pane
+    }
+
+    fn set_explicit_names(&mut self, names: HashSet<String>) {
+        self.explicit_names = names;
+        if !self.show_all_items {
+            self.tagged.retain(|name| self.explicit_names.contains(name));
         }
+        self.cursor = 0;
+    }
+
+    fn toggle_installed_scope(&mut self) {
+        self.show_all_items = !self.show_all_items;
+        if !self.show_all_items {
+            self.tagged.retain(|name| self.explicit_names.contains(name));
+        }
+        self.cursor = 0;
+    }
+
+    fn filtered(&self) -> Vec<&PkgSummary> {
+        let filter = self.filter.to_lowercase();
+        self.all_items
+            .iter()
+            .filter(|p| self.show_all_items || self.explicit_names.contains(&p.name))
+            .filter(|p| {
+                filter.is_empty()
+                    || p.name.to_lowercase().contains(&filter)
+                    || self.tagged.contains(&p.name)
+            })
+            .collect()
     }
 
     fn current_pkg(&self) -> Option<&PkgSummary> {
@@ -160,7 +191,7 @@ impl PaneState {
 }
 
 enum DialogAction {
-    Delete(Vec<String>),
+    Delete,
     Install(Vec<String>),
     Reinstall(Vec<String>),
     Downgrade {
@@ -174,13 +205,15 @@ enum DialogAction {
 struct ConfirmationDialog {
     title: String,
     packages: Vec<String>,
-    cascade: Vec<String>,
+    additional_removals: Vec<String>,
+    hold_packages: Vec<String>,
     total_size: i64,
     selected_button: usize,
     button_labels: Vec<String>,
     action: DialogAction,
 }
 
+#[derive(Clone)]
 struct ProgressState {
     title: String,
     target: String,
@@ -188,16 +221,30 @@ struct ProgressState {
     percent: u16,
 }
 
+#[derive(Clone)]
 struct PackageProgressItem {
     name: String,
     percent: u16,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+struct DownloadProgressItem {
+    name: String,
+    downloaded: i64,
+    total: i64,
+    percent: u16,
+}
+
+#[derive(Clone, Default)]
 struct PackageProgressState {
     packages: Vec<PackageProgressItem>,
     active_package: Option<String>,
     overall_percent: u16,
+    downloads: Vec<DownloadProgressItem>,
+    active_download: Option<String>,
+    download_percent: u16,
+    downloaded_bytes: i64,
+    total_download_bytes: i64,
 }
 
 static PACKAGE_PROGRESS: std::sync::Mutex<PackageProgressState> =
@@ -205,13 +252,65 @@ static PACKAGE_PROGRESS: std::sync::Mutex<PackageProgressState> =
         packages: Vec::new(),
         active_package: None,
         overall_percent: 0,
+        downloads: Vec::new(),
+        active_download: None,
+        download_percent: 0,
+        downloaded_bytes: 0,
+        total_download_bytes: 0,
     });
+
+static QUESTION_REFUSALS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    static ACTIVE_PROGRESS: std::cell::RefCell<Option<ProgressState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn clear_question_refusals() {
+    QUESTION_REFUSALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+fn take_question_refusal_details() -> Option<String> {
+    let refusals = std::mem::take(
+        &mut *QUESTION_REFUSALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    if refusals.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "libalpm declined these questions using the safe default (No):\n{}",
+            refusals
+                .iter()
+                .map(|question| format!("  • {question}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+    }
+}
+
+fn with_question_refusals(message: String) -> String {
+    match take_question_refusal_details() {
+        Some(details) => format!("{message}\n{details}"),
+        None => message,
+    }
+}
 
 fn redraw_transaction_progress() {
     let background = BACKGROUND_BUFFER.with(|buffer| buffer.borrow().clone());
     let Some(background) = background else {
         return;
     };
+    let progress = ACTIVE_PROGRESS.with(|progress| progress.borrow().clone());
+    let state = PACKAGE_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
 
     ACTIVE_TERM.with(|term| {
         let terminal_ptr = term.get();
@@ -219,71 +318,11 @@ fn redraw_transaction_progress() {
             return;
         }
 
-        let state = PACKAGE_PROGRESS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
         unsafe {
             let _ = (*terminal_ptr).draw(|frame| {
                 *frame.buffer_mut() = background.clone();
-
-                let area = frame.area();
-                let right_area = Rect {
-                    x: area.x + area.width / 2,
-                    y: area.y,
-                    width: area.width - area.width / 2,
-                    height: area.height.saturating_sub(1),
-                };
-
-                let block = Block::default()
-                    .title("Transaction Progress")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(NC_CYAN));
-                let inner = block.inner(right_area);
-                frame.render_widget(block, right_area);
-
-                if inner.width == 0 || inner.height == 0 {
-                    return;
-                }
-
-                frame.render_widget(
-                    Paragraph::new(format!("Overall: {}%", state.overall_percent))
-                        .style(Style::default().fg(NC_YELLOW)),
-                    Rect {
-                        x: inner.x,
-                        y: inner.y,
-                        width: inner.width,
-                        height: 1,
-                    },
-                );
-
-                for (index, item) in state.packages.iter().enumerate() {
-                    let y = inner.y + 1 + index as u16;
-                    if y >= inner.y + inner.height {
-                        break;
-                    }
-
-                    let active = state.active_package.as_deref() == Some(item.name.as_str());
-                    let color = if active {
-                        NC_YELLOW
-                    } else if item.percent == 100 {
-                        NC_WHITE
-                    } else {
-                        NC_GRAY
-                    };
-
-                    frame.render_widget(
-                        ratatui::widgets::Gauge::default()
-                            .percent(item.percent)
-                            .label(format!("{} {}%", item.name, item.percent))
-                            .gauge_style(Style::default().fg(color)),
-                        Rect {
-                            x: inner.x,
-                            y,
-                            width: inner.width,
-                            height: 1,
-                        },
-                    );
+                if let Some(progress) = progress.as_ref() {
+                    draw_progress_dialog(frame, progress, &state);
                 }
             });
         }
@@ -296,11 +335,547 @@ enum Modal {
     Message(String),
 }
 
-struct RootGuard;
+fn parse_siglevel(tokens: &[String], mut level: SigLevel) -> Result<SigLevel> {
+    fn set_requirement(level: &mut SigLevel, package: bool, requirement: &str) {
+        let (required, optional) = if package {
+            (SigLevel::PACKAGE, SigLevel::PACKAGE_OPTIONAL)
+        } else {
+            (SigLevel::DATABASE, SigLevel::DATABASE_OPTIONAL)
+        };
+        match requirement {
+            "required" => { level.insert(required); level.remove(optional); }
+            "optional" => { level.remove(required); level.insert(optional); }
+            "never" => { level.remove(required | optional); }
+            _ => {}
+        }
+    }
+    for token in tokens.iter().flat_map(|value| value.split_whitespace()) {
+        let value = token.to_ascii_lowercase();
+        match value.as_str() {
+            "required" | "optional" | "never" => {
+                set_requirement(&mut level, true, &value);
+                set_requirement(&mut level, false, &value);
+            }
+            "packagerequired" => set_requirement(&mut level, true, "required"),
+            "packageoptional" => set_requirement(&mut level, true, "optional"),
+            "packagenever" => set_requirement(&mut level, true, "never"),
+            "databaserequired" => set_requirement(&mut level, false, "required"),
+            "databaseoptional" => set_requirement(&mut level, false, "optional"),
+            "databasenever" => set_requirement(&mut level, false, "never"),
+            "trustedonly" => level.remove(
+                SigLevel::PACKAGE_MARGINAL_OK | SigLevel::PACKAGE_UNKNOWN_OK |
+                SigLevel::DATABASE_MARGINAL_OK | SigLevel::DATABASE_UNKNOWN_OK
+            ),
+            "packagetrustedonly" => level.remove(SigLevel::PACKAGE_MARGINAL_OK | SigLevel::PACKAGE_UNKNOWN_OK),
+            "databasetrustedonly" => level.remove(SigLevel::DATABASE_MARGINAL_OK | SigLevel::DATABASE_UNKNOWN_OK),
+            "trustall" => level.insert(
+                SigLevel::PACKAGE_MARGINAL_OK | SigLevel::PACKAGE_UNKNOWN_OK |
+                SigLevel::DATABASE_MARGINAL_OK | SigLevel::DATABASE_UNKNOWN_OK
+            ),
+            "packagetrustall" => level.insert(SigLevel::PACKAGE_MARGINAL_OK | SigLevel::PACKAGE_UNKNOWN_OK),
+            "databasetrustall" => level.insert(SigLevel::DATABASE_MARGINAL_OK | SigLevel::DATABASE_UNKNOWN_OK),
+            "packagemarginalok" => level.insert(SigLevel::PACKAGE_MARGINAL_OK),
+            "packageunknownok" => level.insert(SigLevel::PACKAGE_UNKNOWN_OK),
+            "databasemarginalok" => level.insert(SigLevel::DATABASE_MARGINAL_OK),
+            "databaseunknownok" => level.insert(SigLevel::DATABASE_UNKNOWN_OK),
+            _ => anyhow::bail!("Unsupported SigLevel option in pacman.conf: {token}"),
+        }
+    }
+    Ok(level)
+}
 
-impl RootGuard {
-    pub fn acquire() -> Result<Self> {
-        Ok(Self)
+fn parse_repo_usage(tokens: &[String]) -> Result<Usage> {
+    if tokens.is_empty() || tokens.iter().any(|v| v.eq_ignore_ascii_case("all")) {
+        return Ok(Usage::ALL);
+    }
+    let mut usage = Usage::NONE;
+    for token in tokens.iter().flat_map(|value| value.split_whitespace()) {
+        match token.to_ascii_lowercase().as_str() {
+            "sync" => usage.insert(Usage::SYNC),
+            "search" => usage.insert(Usage::SEARCH),
+            "install" => usage.insert(Usage::INSTALL),
+            "upgrade" => usage.insert(Usage::UPGRADE),
+            _ => anyhow::bail!("Unsupported repository Usage option: {token}"),
+        }
+    }
+    Ok(usage)
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+    for ch in pattern {
+        if ch == '*' {
+            for index in 1..=value.len() { matched[index] = matched[index] || matched[index - 1]; }
+        } else {
+            for index in (1..=value.len()).rev() {
+                matched[index] = matched[index - 1] && (ch == '?' || ch == value[index - 1]);
+            }
+            matched[0] = false;
+        }
+    }
+    matched[value.len()]
+}
+
+fn is_hold_package(name: &str, hold_pkgs: &[String]) -> bool {
+    hold_pkgs.iter().any(|pattern| wildcard_matches(pattern, name))
+}
+
+fn package_matches_patterns(name: &str, patterns: &HashSet<String>) -> bool {
+    patterns.iter().any(|pattern| wildcard_matches(pattern, name))
+}
+
+fn is_managed_wildcard_lock(name: &str, patterns: &HashSet<String>) -> bool {
+    patterns.iter().any(|pattern| {
+        (pattern.contains('*') || pattern.contains('?'))
+            && wildcard_matches(pattern, name)
+    })
+}
+
+fn managed_wildcard_patterns_to_remove(
+    targets: &[String],
+    installed: &[PkgSummary],
+    patterns: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let selected: HashSet<&str> = targets.iter().map(String::as_str).collect();
+    let mut to_remove = HashSet::new();
+
+    for pattern in patterns
+        .iter()
+        .filter(|pattern| pattern.contains('*') || pattern.contains('?'))
+    {
+        let matches: HashSet<&str> = installed
+            .iter()
+            .filter(|pkg| wildcard_matches(pattern, &pkg.name))
+            .map(|pkg| pkg.name.as_str())
+            .collect();
+
+        if matches.iter().any(|name| selected.contains(name)) {
+            let missing: Vec<&str> = matches.difference(&selected).copied().collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "Cannot unlock wildcard '{pattern}': select all matching installed packages ({})",
+                    missing.join(", ")
+                );
+            }
+            to_remove.insert(pattern.clone());
+        }
+    }
+
+    if !to_remove.is_empty() {
+        let uncovered: Vec<&str> = targets
+            .iter()
+            .map(String::as_str)
+            .filter(|name| {
+                !to_remove
+                    .iter()
+                    .any(|pattern| wildcard_matches(pattern, name))
+            })
+            .collect();
+        if !uncovered.is_empty() {
+            anyhow::bail!(
+                "Cannot mix wildcard unlocks with other package locks; selection also contains {}",
+                uncovered.join(", ")
+            );
+        }
+    }
+
+    Ok(to_remove)
+}
+
+fn parse_package_names(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|value| value.split_whitespace().map(str::to_string))
+        .collect()
+}
+
+fn expand_include_pattern(pattern: &str, config_path: &Path) -> Vec<std::path::PathBuf> {
+    let include_path = Path::new(pattern);
+    let include_path = if include_path.is_absolute() {
+        include_path.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(include_path)
+    };
+
+    let mut candidates = Vec::new();
+    for component in include_path.components() {
+        match component {
+            std::path::Component::RootDir => candidates = vec![std::path::PathBuf::from("/")],
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                for candidate in &mut candidates {
+                    candidate.push("..");
+                }
+            }
+            std::path::Component::Normal(name) => {
+                let name = name.to_string_lossy();
+                if name.contains('*') || name.contains('?') {
+                    let mut matches = Vec::new();
+                    for parent in &candidates {
+                        if let Ok(entries) = fs::read_dir(parent) {
+                            for entry in entries.flatten() {
+                                if wildcard_matches(&name, &entry.file_name().to_string_lossy()) {
+                                    matches.push(entry.path());
+                                }
+                            }
+                        }
+                    }
+                    candidates = matches;
+                } else {
+                    for candidate in &mut candidates {
+                        candidate.push(name.to_string());
+                    }
+                }
+            }
+            std::path::Component::Prefix(_) => {}
+        }
+    }
+    candidates
+}
+
+fn config_includes_file(config_path: &Path, target_path: &Path) -> bool {
+    fn visit(
+        config_path: &Path,
+        target_path: &Path,
+        section: &mut Option<String>,
+        visited: &mut HashSet<(std::path::PathBuf, Option<String>)>,
+    ) -> bool {
+        let config_path =
+            fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+        if !visited.insert((config_path.clone(), section.clone())) {
+            return false;
+        }
+
+        let Ok(content) = fs::read_to_string(&config_path) else {
+            return false;
+        };
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                *section = Some(trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase());
+                continue;
+            }
+
+            let Some((key, value)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if !key.trim().eq_ignore_ascii_case("Include")
+                || section.as_deref() != Some("options")
+            {
+                continue;
+            }
+
+            // pacman.conf only supports whole-line comments, so preserve '#' in paths.
+            let pattern = value.trim().trim_matches('"').trim_matches('\'');
+            for included_path in expand_include_pattern(pattern, &config_path) {
+                let resolved = fs::canonicalize(&included_path)
+                    .unwrap_or_else(|_| included_path.clone());
+                if resolved == target_path {
+                    return true;
+                }
+                if included_path.is_file()
+                    && visit(&included_path, target_path, section, visited)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    visit(
+        config_path,
+        target_path,
+        &mut None,
+        &mut HashSet::new(),
+    )
+}
+
+fn pacman_config_includes_managed_ignore_file() -> bool {
+    let config_path = Path::new("/etc/pacman.conf");
+    let target_path = Path::new(IGNORE_PKG_FILE);
+    let Ok(target_path) = fs::canonicalize(target_path) else {
+        return false;
+    };
+    config_includes_file(config_path, &target_path)
+}
+
+fn parse_external_ignore_packages(
+    configured: &[String],
+    managed: &HashSet<String>,
+    managed_file_included: bool,
+) -> HashSet<String> {
+    // pacmanconf expands Include directives and loses their source-file provenance.
+    // Only subtract APC-managed entries when the managed file is in the Include chain.
+    let mut packages = parse_package_names(configured);
+    if managed_file_included {
+        for managed_pkg in managed {
+            if let Some(index) = packages.iter().position(|pkg| pkg == managed_pkg) {
+                packages.remove(index);
+            }
+        }
+    }
+    packages.into_iter().collect()
+}
+
+fn parse_managed_ignore_pkg(content: &str) -> HashSet<String> {
+    let mut packages = HashSet::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("IgnorePkg") {
+                packages.extend(value.split_whitespace().map(str::to_string));
+            }
+        }
+    }
+    packages
+}
+
+fn updated_ignore_packages(
+    current: &[String],
+    previous_managed: &HashSet<String>,
+    next_managed: &HashSet<String>,
+    external: &HashSet<String>,
+) -> Vec<String> {
+    let mut updated: Vec<String> = current
+        .iter()
+        .filter(|package| !previous_managed.contains(*package))
+        .cloned()
+        .collect();
+
+    updated.extend(next_managed.iter().filter(|package| {
+        !external
+            .iter()
+            .any(|pattern| wildcard_matches(pattern, package))
+    }).cloned());
+
+    updated.sort();
+    updated.dedup();
+    updated
+}
+
+fn ignorepkg_lists_match(actual: &[String], expected: &[String]) -> bool {
+    let mut actual_sorted = actual.to_vec();
+    let mut expected_sorted = expected.to_vec();
+    actual_sorted.sort();
+    actual_sorted.dedup();
+    expected_sorted.sort();
+    expected_sorted.dedup();
+    actual_sorted == expected_sorted
+}
+
+fn apply_ignorepkgs_verified(alpm: &mut Alpm, expected: &[String]) -> Result<()> {
+    let expected_refs: Vec<&str> = expected.iter().map(String::as_str).collect();
+    alpm.set_ignorepkgs(expected_refs.iter())?;
+
+    let actual: Vec<String> = alpm.ignorepkgs().iter().map(str::to_string).collect();
+    if !ignorepkg_lists_match(&actual, expected) {
+        anyhow::bail!(
+            "libalpm accepted the IgnorePkg update but its live list differs from the requested list (expected {} entries, found {})",
+            expected.iter().collect::<HashSet<_>>().len(),
+            actual.iter().collect::<HashSet<_>>().len()
+        );
+    }
+    Ok(())
+}
+
+fn save_locked_packages_to(
+    path: &Path,
+    external_ignored: &HashSet<String>,
+    locked_pkgs: &HashSet<String>,
+) -> Result<()> {
+    let mut list: Vec<&str> = locked_pkgs
+        .iter()
+        .filter(|name| {
+            !external_ignored
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, name))
+        })
+        .map(String::as_str)
+        .collect();
+    list.sort();
+
+    let content = if list.is_empty() {
+        "# Managed by Arch Package Commander (apc)\nIgnorePkg =\n".to_string()
+    } else {
+        format!(
+            "# Managed by Arch Package Commander (apc)\nIgnorePkg = {}\n",
+            list.join(" ")
+        )
+    };
+
+    atomic_replace_file(path, content.as_bytes())
+}
+
+fn update_ignorepkg_state<Persist, Apply>(
+    previous_managed: &HashSet<String>,
+    next_managed: &HashSet<String>,
+    previous_ignorepkgs: &[String],
+    next_ignorepkgs: &[String],
+    mut persist: Persist,
+    mut apply: Apply,
+) -> Result<()>
+where
+    Persist: FnMut(&HashSet<String>) -> Result<()>,
+    Apply: FnMut(&[String]) -> Result<()>,
+{
+    // Persist the complete new managed set before changing the live ALPM handle.
+    persist(next_managed)?;
+
+    if let Err(err) = apply(next_ignorepkgs) {
+        let file_rollback = persist(previous_managed);
+        let alpm_rollback = apply(previous_ignorepkgs);
+
+        let mut message = format!("Failed to update libalpm's IgnorePkg list: {err}");
+        if let Err(rollback_err) = file_rollback {
+            message.push_str(&format!(
+                "\nFailed to restore the previous managed IgnorePkg file: {rollback_err}"
+            ));
+        }
+        if let Err(rollback_err) = alpm_rollback {
+            message.push_str(&format!(
+                "\nFailed to restore libalpm's previous IgnorePkg list: {rollback_err}"
+            ));
+        }
+        anyhow::bail!("{message}");
+    }
+
+    Ok(())
+}
+
+fn atomic_replace_file(path: &Path, content: &[u8]) -> Result<()> {
+    // Resolve an existing symlink so replacing the file does not replace the
+    // symlink itself and break pacman.conf's Include chain.
+    let target = match fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(path)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                anyhow::bail!("cannot atomically replace {}: its symlink target does not exist", path.display());
+            }
+            path.to_path_buf()
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", target.display()))?;
+    let filename = target
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", target.display()))?;
+
+    let existing = match fs::metadata(&target) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let mode = existing
+        .as_ref()
+        .map(|metadata| metadata.mode() & 0o7777)
+        .unwrap_or(0o644);
+
+    let mut temporary_path = None;
+    let mut temporary_file = None;
+    for attempt in 0..100 {
+        let name = format!(
+            ".{}.apc-{}-{attempt}.tmp",
+            filename.to_string_lossy(),
+            std::process::id()
+        );
+        let candidate = parent.join(name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary_path = Some(candidate);
+                temporary_file = Some(file);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let temporary_path = temporary_path
+        .ok_or_else(|| anyhow::anyhow!("could not allocate a temporary file beside {}", target.display()))?;
+    let write_result = (|| -> Result<()> {
+        let mut file = temporary_file.expect("temporary file exists when its path is set");
+
+        if let Some(metadata) = existing.as_ref() {
+            if unsafe { libc::fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+
+        // The temporary file is in the same directory, so rename is atomic.
+        fs::rename(&temporary_path, &target)?;
+
+        // Persist the directory entry where supported. The rename has already
+        // committed if this best-effort durability flush is unavailable.
+        if let Ok(directory) = fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    write_result
+}
+
+struct TerminalGuard {
+    tty: std::fs::File,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(&mut self.tty, LeaveAlternateScreen);
+    }
+}
+
+struct CommitGuard {
+    saved_stdout: libc::c_int,
+    saved_stderr: libc::c_int,
+}
+
+impl Drop for CommitGuard {
+    fn drop(&mut self) {
+        ACTIVE_TERM.with(|term| term.set(std::ptr::null_mut()));
+        ACTIVE_PROGRESS.with(|progress| *progress.borrow_mut() = None);
+        BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = None);
+        let mut state = PACKAGE_PROGRESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state = PackageProgressState::default();
+        if self.saved_stdout >= 0 {
+            unsafe { libc::dup2(self.saved_stdout, 1); libc::close(self.saved_stdout); }
+        }
+        if self.saved_stderr >= 0 {
+            unsafe { libc::dup2(self.saved_stderr, 2); libc::close(self.saved_stderr); }
+        }
     }
 }
 
@@ -311,6 +886,7 @@ struct App {
     right: PaneState,
     info_mode: bool,
     locked_pkgs: HashSet<String>,
+    pacman_conf_ignored_pkgs: HashSet<String>,
     updates_view: Option<SysUpdateInfo>,
     upgrade_selected_button: usize,
     downgrade_view: Option<DowngradeView>,
@@ -318,36 +894,140 @@ struct App {
     modal: Option<Modal>,
     progress: Option<ProgressState>,
     system_upgrade_in_progress: bool,
+    syncdbs_synced_without_upgrade: bool,
+    partial_upgrade_marker: std::path::PathBuf,
+    hold_pkgs: Vec<String>,
     should_quit: bool,
 }
 
 impl App {
-    fn new() -> Result<Self> {
-        let pacconf = pacmanconf::Config::new().unwrap_or_default();
-        let mut alpm = Alpm::new(
-            pacconf.root_dir.as_str(),
-            pacconf.db_path.as_str(),
-        )?;
+    fn mark_partial_upgrade_pending(&mut self) -> Result<()> {
+        if let Err(err) = fs::write(&self.partial_upgrade_marker, b"APC requires a full system upgrade after database synchronization.\n") {
+            self.progress = None;
+            return Err(err.into());
+        }
+        self.syncdbs_synced_without_upgrade = true;
+        Ok(())
+    }
 
-        // Connect pacman.log
-        let _ = alpm.set_logfile(pacconf.log_file.as_str());
-
-        // 1. Ensure the official system cache is ALWAYS the primary write directory
-        let default_cache = "/var/cache/pacman/pkg/";
-        let _ = alpm.add_cachedir(default_cache);
-
-        let mut cache_dirs = vec![default_cache.to_string()];
-
-        // 2. Register any other custom/local cachedirs as secondary caches
-        for cachedir in &pacconf.cache_dir {
-            let clean_dir = cachedir.trim_end_matches('/');
-            if clean_dir != "/var/cache/pacman/pkg" {
-                let _ = alpm.add_cachedir(cachedir.as_str());
+    fn clear_partial_upgrade_pending(&mut self) -> Result<()> {
+        match fs::remove_file(&self.partial_upgrade_marker) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                self.syncdbs_synced_without_upgrade = true;
+                return Err(err.into());
             }
-            if !cache_dirs.contains(cachedir) {
+        }
+        self.syncdbs_synced_without_upgrade = false;
+        Ok(())
+    }
+
+    fn new() -> Result<Self> {
+        let pacconf = pacmanconf::Config::new()?;
+        let mut alpm = Alpm::new(pacconf.root_dir.as_str(), pacconf.db_path.as_str())?;
+        let partial_upgrade_marker = Path::new(alpm.lockfile())
+            .parent()
+            .unwrap_or_else(|| Path::new("/var/lib/pacman"))
+            .join("apc-partial-upgrade-pending");
+        let syncdbs_synced_without_upgrade = partial_upgrade_marker.exists();
+
+        let global_sig_level = parse_siglevel(
+            &pacconf.sig_level,
+            SigLevel::PACKAGE | SigLevel::DATABASE,
+        )?;
+        alpm.set_default_siglevel(global_sig_level)?;
+        alpm.set_local_file_siglevel(parse_siglevel(&pacconf.local_file_sig_level, global_sig_level)?)?;
+        alpm.set_remote_file_siglevel(parse_siglevel(&pacconf.remote_file_sig_level, global_sig_level)?)?;
+        alpm.set_gpgdir(pacconf.gpg_dir.as_str())?;
+        alpm.set_logfile(pacconf.log_file.as_str())?;
+        alpm.set_check_space(pacconf.check_space);
+        alpm.set_use_syslog(pacconf.use_syslog);
+        alpm.set_disable_dl_timeout(pacconf.disable_download_timeout);
+        alpm.set_parallel_downloads(pacconf.parallel_downloads.min(u32::MAX as u64) as u32);
+        alpm.set_disable_sandbox_filesystem(pacconf.disable_sandbox || pacconf.disable_sandbox_filesystem);
+        alpm.set_disable_sandbox_syscalls(pacconf.disable_sandbox || pacconf.disable_sandbox_syscalls);
+        if let Some(download_user) = pacconf.download_user.as_deref() {
+            alpm.set_sandbox_user(Some(download_user))?;
+        }
+
+        let mut cache_dirs = Vec::new();
+        for cachedir in &pacconf.cache_dir {
+            let normalized = cachedir.trim_end_matches('/');
+            if !cache_dirs.iter().any(|existing: &String| existing.trim_end_matches('/') == normalized) {
+                alpm.add_cachedir(cachedir.as_str())?;
                 cache_dirs.push(cachedir.clone());
             }
         }
+        for hook_dir in &pacconf.hook_dir { alpm.add_hookdir(hook_dir.as_str())?; }
+        for value in &pacconf.no_upgrade {
+            for pattern in value.split_whitespace() { alpm.add_noupgrade(pattern)?; }
+        }
+        for value in &pacconf.no_extract {
+            for pattern in value.split_whitespace() { alpm.add_noextract(pattern)?; }
+        }
+        for value in &pacconf.ignore_group {
+            for group in value.split_whitespace() { alpm.add_ignoregroup(group)?; }
+        }
+
+        let configured_architectures: Vec<String> = pacconf.architecture.iter()
+            .flat_map(|value| value.split_whitespace().map(str::to_string))
+            .collect();
+        let architectures: Vec<String> = if configured_architectures.is_empty()
+            || configured_architectures.iter().any(|arch| arch.eq_ignore_ascii_case("auto"))
+        {
+            vec![std::env::consts::ARCH.to_string()]
+        } else {
+            configured_architectures
+        };
+        for architecture in &architectures {
+            alpm.add_architecture(architecture.as_str())?;
+        }
+        let arch = architectures.first().cloned().unwrap_or_else(|| std::env::consts::ARCH.to_string());
+
+        for repo in &pacconf.repos {
+            for server in &repo.servers {
+                let expanded = server.replace("$repo", &repo.name).replace("$arch", &arch);
+                if let Some(local_path) = expanded.strip_prefix("file://") {
+                    let clean_path = local_path.trim_end_matches('/');
+                    let already_configured = cache_dirs.iter()
+                        .any(|existing| existing.trim_end_matches('/') == clean_path);
+                    if !already_configured && Path::new(clean_path).is_dir() {
+                        alpm.add_cachedir(clean_path)?;
+                        cache_dirs.push(clean_path.to_string());
+                    }
+                }
+            }
+        }
+        for repo in &pacconf.repos {
+            let repo_sig_level = parse_siglevel(&repo.sig_level, global_sig_level)?;
+            let db = alpm.register_syncdb_mut(repo.name.as_str(), repo_sig_level)?;
+            db.set_usage(parse_repo_usage(&repo.usage)?)?;
+            for server in &repo.servers {
+                let expanded = server.replace("$repo", &repo.name).replace("$arch", &arch);
+                db.add_server(expanded.as_str())?;
+            }
+        }
+
+        let mut locked_pkgs = Self::load_locked_packages();
+        let pacman_conf_ignored_pkgs = parse_external_ignore_packages(
+            &pacconf.ignore_pkg,
+            &locked_pkgs,
+            pacman_config_includes_managed_ignore_file(),
+        );
+        // If a package is also excluded outside APC's managed file, external
+        // configuration takes ownership and APC must not offer to unlock it.
+        locked_pkgs.retain(|pkg| {
+            !pacman_conf_ignored_pkgs
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, pkg))
+        });
+        for pkg in locked_pkgs.union(&pacman_conf_ignored_pkgs) {
+            alpm.add_ignorepkg(pkg.as_str())?;
+        }
+        let hold_pkgs: Vec<String> = pacconf.hold_pkg.iter()
+            .flat_map(|value| value.split_whitespace().map(str::to_string))
+            .collect();
 
         // Live In-TUI progress callback: record package progress and redraw the current dialog
         alpm.set_progress_cb((), move |progress, pkgname, percent, howmany, current, _| {
@@ -394,6 +1074,84 @@ impl App {
             redraw_transaction_progress();
         });
 
+        // Refuse unresolved ALPM questions rather than silently approving package
+        // replacement, conflict removal, ignored-package installation, or key import.
+        // Provider selection is also declined until APC has an interactive provider chooser,
+        // so transactions that require a choice stop safely.
+        // The refusal is attached to the transaction error so the user sees why it stopped.
+        alpm.set_question_cb((), |question, _| {
+            let details = format!("{question:?}");
+            match question.question() {
+                Question::InstallIgnorepkg(mut prompt) => prompt.set_install(false),
+                Question::Replace(prompt) => prompt.set_replace(false),
+                Question::Conflict(mut prompt) => prompt.set_remove(false),
+                Question::Corrupted(mut prompt) => prompt.set_remove(false),
+                Question::RemovePkgs(mut prompt) => prompt.set_skip(false),
+                Question::SelectProvider(mut prompt) => prompt.set_index(-1),
+                Question::ImportKey(mut prompt) => prompt.set_import(false),
+            }
+            QUESTION_REFUSALS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(details);
+        });
+
+        // Report real package-download progress alongside package-operation progress.
+        alpm.set_dl_cb((), |filename, event: AnyDownloadEvent<'_>, _| {
+            let mut state = PACKAGE_PROGRESS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            match event.event() {
+                DownloadEvent::Init(_) => {
+                    if !state.downloads.iter().any(|item| item.name == filename) {
+                        state.downloads.push(DownloadProgressItem {
+                            name: filename.to_string(),
+                            downloaded: 0,
+                            total: 0,
+                            percent: 0,
+                        });
+                    }
+                    state.active_download = Some(filename.to_string());
+                }
+                DownloadEvent::Progress(progress) => {
+                    if let Some(item) = state.downloads.iter_mut().find(|item| item.name == filename) {
+                        item.downloaded = progress.downloaded.max(0);
+                        item.total = progress.total.max(0);
+                        item.percent = if item.total > 0 {
+                            ((item.downloaded.saturating_mul(100) / item.total).min(100)) as u16
+                        } else {
+                            0
+                        };
+                    }
+                    state.active_download = Some(filename.to_string());
+                }
+                DownloadEvent::Completed(completed) => {
+                    if let Some(item) = state.downloads.iter_mut().find(|item| item.name == filename) {
+                        item.total = item.total.max(completed.total.max(0));
+                        if matches!(completed.result, DownloadResult::Success | DownloadResult::UpToDate) {
+                            item.downloaded = item.total;
+                            item.percent = 100;
+                        }
+                    }
+                    state.active_download = Some(filename.to_string());
+                }
+                DownloadEvent::Retry(_) => {
+                    state.active_download = Some(filename.to_string());
+                }
+            }
+
+            state.downloaded_bytes = state.downloads.iter().map(|item| item.downloaded).sum();
+            state.total_download_bytes = state.downloads.iter().map(|item| item.total).sum();
+            state.download_percent = if state.total_download_bytes > 0 {
+                ((state.downloaded_bytes.saturating_mul(100) / state.total_download_bytes).min(100)) as u16
+            } else {
+                0
+            };
+            drop(state);
+            redraw_transaction_progress();
+        });
+
         // Register ALPM log callback
         alpm.set_log_cb((), |level, msg, _| {
             if LOG_TO_STDOUT.load(Ordering::Relaxed) {
@@ -405,56 +1163,14 @@ impl App {
             }
         });
 
-        let arch = pacconf
-            .architecture
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "x86_64".to_string());
-
-        // 1. Auto-register local file:// repositories as secondary caches first
-        // (prevents conflicting mutable borrows of alpm)
-        for repo in &pacconf.repos {
-            for server in &repo.servers {
-                let expanded = server
-                    .replace("$repo", &repo.name)
-                    .replace("$arch", &arch);
-                if let Some(local_path) = expanded.strip_prefix("file://") {
-                    let clean_path = local_path.trim_end_matches('/');
-                    if clean_path != "/var/cache/pacman/pkg" && Path::new(clean_path).is_dir() {
-                        let _ = alpm.add_cachedir(clean_path);
-                        if !cache_dirs.contains(&clean_path.to_string()) {
-                            cache_dirs.push(clean_path.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Register syncdb databases
-        for repo in &pacconf.repos {
-            let sig_level = SigLevel::PACKAGE_OPTIONAL | SigLevel::DATABASE_OPTIONAL;
-            if let Ok(db) = alpm.register_syncdb_mut(repo.name.as_str(), sig_level) {
-                for server in &repo.servers {
-                    let expanded = server
-                        .replace("$repo", &repo.name)
-                        .replace("$arch", &arch);
-                    let _ = db.add_server(expanded.as_str());
-                }
-            }
-        }
-
-        let locked_pkgs = Self::load_locked_packages();
-        for pkg in &locked_pkgs {
-            let _ = alpm.add_ignorepkg(pkg.as_str());
-        }
-
         let mut app = Self {
             alpm,
             active_pane: ActivePane::Left,
-            left: PaneState::new(Vec::new()),
+            left: PaneState::new_installed(Vec::new()),
             right: PaneState::new(Vec::new()),
             info_mode: false,
             locked_pkgs,
+            pacman_conf_ignored_pkgs,
             updates_view: None,
             upgrade_selected_button: 0,
             downgrade_view: None,
@@ -462,6 +1178,9 @@ impl App {
             modal: None,
             progress: None,
             system_upgrade_in_progress: false,
+            syncdbs_synced_without_upgrade,
+            partial_upgrade_marker,
+            hold_pkgs,
             should_quit: false,
         };
 
@@ -471,58 +1190,22 @@ impl App {
     }
 
     fn load_locked_packages() -> HashSet<String> {
-        let mut locked = HashSet::new();
-        if let Ok(content) = fs::read_to_string(IGNORE_PKG_FILE) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with('#') || trimmed.is_empty() {
-                    continue;
-                }
-                if let Some((key, val)) = trimmed.split_once('=') {
-                    if key.trim().eq_ignore_ascii_case("IgnorePkg") {
-                        for pkg in val.split_whitespace() {
-                            locked.insert(pkg.trim().to_string());
-                        }
-                    }
-                }
-            }
-        }
-        locked
+        fs::read_to_string(IGNORE_PKG_FILE)
+            .map(|content| parse_managed_ignore_pkg(&content))
+            .unwrap_or_default()
     }
 
-    fn save_locked_packages(&self) -> Result<()> {
-        let dir = Path::new("/etc/pacman.d");
-        if !dir.exists() {
-            let _ = fs::create_dir_all(dir);
-        }
-        let mut list: Vec<&str> = self.locked_pkgs.iter().map(|s| s.as_str()).collect();
-        list.sort();
+    fn is_package_locked(&self, name: &str) -> bool {
+        package_matches_patterns(name, &self.locked_pkgs)
+            || package_matches_patterns(name, &self.pacman_conf_ignored_pkgs)
+    }
 
-        let content = if list.is_empty() {
-            "# Managed by Arch Package Commander (apc)\nIgnorePkg =\n".to_string()
-        } else {
-            format!(
-                "# Managed by Arch Package Commander (apc)\nIgnorePkg = {}\n",
-                list.join(" ")
-            )
-        };
-
-        if let Err(e) = fs::write(IGNORE_PKG_FILE, &content) {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                let mut child = std::process::Command::new("sudo")
-                    .args(["tee", IGNORE_PKG_FILE])
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::null())
-                    .spawn()?;
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(content.as_bytes())?;
-                }
-                child.wait()?;
-            } else {
-                return Err(e.into());
-            }
-        }
-        Ok(())
+    fn save_locked_packages(&self, locked_pkgs: &HashSet<String>) -> Result<()> {
+        save_locked_packages_to(
+            Path::new(IGNORE_PKG_FILE),
+            &self.pacman_conf_ignored_pkgs,
+            locked_pkgs,
+        )
     }
 
     fn toggle_lock_current(&mut self) -> Result<()> {
@@ -534,58 +1217,259 @@ impl App {
             return Ok(());
         };
 
-        let any_unlocked = targets.iter().any(|t| !self.locked_pkgs.contains(t));
+        let externally_locked: Vec<&str> = targets
+            .iter()
+            .filter(|target| {
+                self.pacman_conf_ignored_pkgs
+                    .iter()
+                    .any(|pattern| wildcard_matches(pattern, target))
+            })
+            .map(String::as_str)
+            .collect();
+        if !externally_locked.is_empty() {
+            anyhow::bail!(
+                "Cannot change {}: excluded by pacman.conf; APC leaves those settings untouched",
+                externally_locked.join(", ")
+            );
+        }
 
-        for t in &targets {
-            if any_unlocked {
-                self.locked_pkgs.insert(t.clone());
-                let _ = self.alpm.add_ignorepkg(t.as_str());
-            } else {
-                self.locked_pkgs.remove(t);
-                let _ = self.alpm.remove_ignorepkg(t.as_str());
+        let wildcard_patterns_to_remove = managed_wildcard_patterns_to_remove(
+            &targets,
+            &self.left.all_items,
+            &self.locked_pkgs,
+        )?;
+        let previous_locked = self.locked_pkgs.clone();
+        let mut next_locked = previous_locked.clone();
+
+        if !wildcard_patterns_to_remove.is_empty() {
+            for pattern in &wildcard_patterns_to_remove {
+                next_locked.remove(pattern);
+            }
+        } else {
+            let managed_wildcard_locked: Vec<&str> = targets
+                .iter()
+                .filter(|target| is_managed_wildcard_lock(target, &self.locked_pkgs))
+                .map(String::as_str)
+                .collect();
+            if !managed_wildcard_locked.is_empty() {
+                anyhow::bail!(
+                    "Cannot change {}: covered by an APC-managed wildcard in {}; edit that pattern to change the lock",
+                    managed_wildcard_locked.join(", "),
+                    IGNORE_PKG_FILE
+                );
+            }
+
+            let any_unlocked = targets.iter().any(|target| !previous_locked.contains(target));
+            for target in &targets {
+                if any_unlocked {
+                    next_locked.insert(target.clone());
+                } else {
+                    next_locked.remove(target);
+                }
             }
         }
 
-        self.save_locked_packages()?;
+        let previous_ignorepkgs: Vec<String> = self
+            .alpm
+            .ignorepkgs()
+            .iter()
+            .map(str::to_string)
+            .collect();
+        let next_ignorepkgs = updated_ignore_packages(
+            &previous_ignorepkgs,
+            &previous_locked,
+            &next_locked,
+            &self.pacman_conf_ignored_pkgs,
+        );
+
+        let external_ignored = self.pacman_conf_ignored_pkgs.clone();
+        update_ignorepkg_state(
+            &previous_locked,
+            &next_locked,
+            &previous_ignorepkgs,
+            &next_ignorepkgs,
+            |locked| {
+                save_locked_packages_to(
+                    Path::new(IGNORE_PKG_FILE),
+                    &external_ignored,
+                    locked,
+                )
+            },
+            |packages| apply_ignorepkgs_verified(&mut self.alpm, packages),
+        )?;
+
+        self.locked_pkgs = next_locked;
         self.left.tagged.clear();
         Ok(())
     }
 
-    fn get_removal_cascade(&self, targets: &[String]) -> (Vec<String>, i64) {
-        let mut to_remove = HashSet::new();
-        let mut queue = Vec::new();
-
-        for t in targets {
-            to_remove.insert(t.clone());
-            queue.push(t.clone());
-        }
-
-        while let Some(current) = queue.pop() {
-            for pkg in self.alpm.localdb().pkgs() {
-                let name = pkg.name().to_string();
-                if to_remove.contains(&name) {
-                    continue;
+    fn prepare_removal(&mut self, targets: &[String]) -> Result<(Vec<String>, Vec<String>, i64)> {
+        check_database_lock(&self.alpm)?;
+        clear_question_refusals();
+        self.alpm.trans_init(TransFlag::RECURSE | TransFlag::UNNEEDED | TransFlag::NO_SAVE)?;
+        for name in targets {
+            let pkg = match self.alpm.localdb().pkg(name.as_str()) {
+                Ok(pkg) => pkg,
+                Err(err) => {
+                    let message = format!("{err:?}");
+                    let _ = self.alpm.trans_release();
+                    anyhow::bail!("Selected package '{name}' is not installed: {message}");
                 }
-                let depends_on_current = pkg.depends().into_iter().any(|dep| dep.name() == current);
-                if depends_on_current {
-                    to_remove.insert(name.clone());
-                    queue.push(name);
-                }
+            };
+            if let Err(err) = self.alpm.trans_remove_pkg(pkg) {
+                let message = format!("{err:?}");
+                let _ = self.alpm.trans_release();
+                anyhow::bail!("Cannot queue '{name}' for removal: {message}");
             }
+        }
+        let prepare_result = self.alpm.trans_prepare().map_err(|err| format!("{err:?}"));
+        let prepare_error = match prepare_result {
+            Ok(()) => take_question_refusal_details()
+                .map(|details| format!("Removal stopped: {details}")),
+            Err(err) => {
+                let mut details = Vec::new();
+                for name in targets {
+                    if let Ok(pkg) = self.alpm.localdb().pkg(name.as_str()) {
+                        let dependents: Vec<String> = pkg
+                            .required_by()
+                            .iter()
+                            .map(|dependent| dependent.to_string())
+                            .collect();
+                        if !dependents.is_empty() {
+                            details.push(format!("{name} is required by {}", dependents.join(", ")));
+                        }
+                    }
+                }
+                let mut message = format!("Safe removal was rejected by dependency checks: {err}");
+                if !details.is_empty() {
+                    message.push_str(&format!("\nInstalled dependents: {}", details.join("; ")));
+                }
+                Some(with_question_refusals(message))
+            }
+        };
+        if let Some(err) = prepare_error {
+            let _ = self.alpm.trans_release();
+            anyhow::bail!("{err}");
+        }
+        let removals: Vec<(String, i64)> = self.alpm.trans_remove().iter()
+            .map(|pkg| (pkg.name().to_string(), pkg.isize()))
+            .collect();
+        let removal_names: HashSet<String> = removals.iter().map(|(name, _)| name.clone()).collect();
+        if let Some(missing) = targets.iter().find(|name| !removal_names.contains(*name)) {
+            let dependents: Vec<String> = self.alpm.localdb().pkg(missing.as_str())
+                .map(|pkg| pkg.required_by().iter().map(|dependent| dependent.to_string()).collect())
+                .unwrap_or_default();
+            let _ = self.alpm.trans_release();
+            if dependents.is_empty() {
+                anyhow::bail!("libalpm did not include selected package '{missing}' in the prepared removal transaction");
+            }
+            anyhow::bail!(
+                "libalpm did not include selected package '{missing}' in the prepared removal transaction; installed dependents: {}",
+                dependents.join(", ")
+            );
+        }
+        let mut additional: Vec<String> = removals.iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| !targets.contains(name))
+            .collect();
+        additional.sort();
+        let total_size = removals.iter().map(|(_, size)| *size).sum();
+        let hold_packages: Vec<String> = removals.iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| is_hold_package(name, &self.hold_pkgs))
+            .collect();
+        Ok((additional, hold_packages, total_size))
+    }
+
+    fn open_removal_confirmation(&mut self, targets: Vec<String>) {
+        if targets.is_empty() { return; }
+        match self.prepare_removal(&targets) {
+            Ok((additional_removals, hold_packages, total_size)) => {
+                self.modal = Some(Modal::Confirm(ConfirmationDialog {
+                    title: "Remove packages (-Rns)".to_string(),
+                    packages: targets,
+                    additional_removals,
+                    hold_packages,
+                    total_size,
+                    selected_button: 1,
+                    button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
+                    action: DialogAction::Delete,
+                }));
+            }
+            Err(err) => self.modal = Some(Modal::Message(format!("Removal blocked: {err}"))),
+        }
+    }
+
+    fn total_download_size_for_packages(
+        &mut self,
+        targets: &[String],
+        reinstall: bool,
+    ) -> Result<i64> {
+        if self.syncdbs_synced_without_upgrade {
+            anyhow::bail!("Package databases were synchronized separately. Run a full system upgrade (F6) before installing or reinstalling packages.");
+        }
+        check_database_lock(&self.alpm)?;
+
+        let flags = if reinstall { TransFlag::empty() } else { TransFlag::NEEDED };
+        self.alpm.trans_init(flags)?;
+
+        clear_question_refusals();
+        let prepare_result = (|| -> Result<i64> {
+            for name in targets {
+                let pkg = self.alpm.syncdbs().iter()
+                    .find_map(|db| db.pkg(name.as_str()).ok())
+                    .ok_or_else(|| anyhow::anyhow!("Package not found in syncdbs: {name}"))?;
+                self.alpm.trans_add_pkg(pkg).map_err(|err| {
+                    anyhow::anyhow!("Failed to queue package '{name}': {err:?}")
+                })?;
+            }
+
+            self.alpm.trans_prepare()
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("Transaction prepare failed: {err:?}"))))?;
+            if let Some(details) = take_question_refusal_details() {
+                anyhow::bail!("Install preview stopped: {details}");
+            }
+
+            Ok(self.alpm.trans_add().iter().map(|pkg| pkg.download_size()).sum())
+        })();
+
+        let release_result = self.alpm.trans_release();
+        match (prepare_result, release_result) {
+            (Ok(size), Ok(())) => Ok(size),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err.into()),
+        }
+    }
+
+    fn open_install_confirmation(&mut self, targets: Vec<String>, reinstall: bool) {
+        if targets.is_empty() {
+            return;
         }
 
-        let mut total_size = 0i64;
-        let mut cascade_list = Vec::new();
-        for name in &to_remove {
-            if let Ok(pkg) = self.alpm.localdb().pkg(name.as_str()) {
-                total_size += pkg.isize();
+        match self.total_download_size_for_packages(&targets, reinstall) {
+            Ok(total_size) => {
+                let title = if reinstall { "Reinstall" } else { "Install" };
+                let action = if reinstall {
+                    DialogAction::Reinstall(targets.clone())
+                } else {
+                    DialogAction::Install(targets.clone())
+                };
+                self.modal = Some(Modal::Confirm(ConfirmationDialog {
+                    title: title.to_string(),
+                    packages: targets,
+                    additional_removals: Vec::new(),
+                    hold_packages: Vec::new(),
+                    total_size,
+                    selected_button: 0,
+                    button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
+                    action,
+                }));
             }
-            if !targets.contains(name) {
-                cascade_list.push(name.clone());
+            Err(err) => {
+                let operation = if reinstall { "Reinstall" } else { "Install" };
+                self.modal = Some(Modal::Message(format!("{operation} preview failed: {err}")));
             }
         }
-        cascade_list.sort();
-        (cascade_list, total_size)
     }
 
     fn get_pkg_details(&self, pkg_name: &str, installed: bool) -> Vec<String> {
@@ -637,13 +1521,23 @@ impl App {
         step: &str,
         percent: u16,
     ) -> Result<()> {
-        self.progress = Some(ProgressState {
+        let progress = ProgressState {
             title: title.to_string(),
             target: target.to_string(),
             step: step.to_string(),
             percent,
-        });
-        terminal.draw(|f| draw_ui(f, self))?;
+        };
+        self.progress = Some(progress.clone());
+        ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some(progress));
+        if let Err(err) = terminal.draw(|f| {
+            draw_ui(f, self);
+            BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = Some(f.buffer_mut().clone()));
+        }) {
+            self.progress = None;
+            ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = None);
+            BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = None);
+            return Err(err.into());
+        }
         thread::sleep(Duration::from_millis(50));
         Ok(())
     }
@@ -657,35 +1551,26 @@ impl App {
     where
         F: FnOnce() -> Result<R>,
     {
-        let null_fd = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY) };
         let saved_stdout = unsafe { libc::dup(1) };
         let saved_stderr = unsafe { libc::dup(2) };
-        if null_fd >= 0 {
-            unsafe {
-                libc::dup2(null_fd, 1);
-                libc::dup2(null_fd, 2);
-                libc::close(null_fd);
-            }
+        if saved_stdout < 0 || saved_stderr < 0 {
+            if saved_stdout >= 0 { unsafe { libc::close(saved_stdout); } }
+            if saved_stderr >= 0 { unsafe { libc::close(saved_stderr); } }
+            anyhow::bail!("Unable to preserve stdout/stderr for the package transaction");
         }
-
-        ACTIVE_TERM.with(|t| t.set(terminal as *mut _));
-
-
-        let result = action();
-
-        ACTIVE_TERM.with(|t| t.set(std::ptr::null_mut()));
-
-        if saved_stdout >= 0 {
-            unsafe {
-                libc::dup2(saved_stdout, 1);
-                libc::dup2(saved_stderr, 2);
-                libc::close(saved_stdout);
-                libc::close(saved_stderr);
-            }
+        let _guard = CommitGuard { saved_stdout, saved_stderr };
+        let null_fd = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY) };
+        if null_fd < 0 {
+            anyhow::bail!("Unable to open /dev/null for transaction output");
         }
-
-
-        result
+        let stdout_result = unsafe { libc::dup2(null_fd, 1) };
+        let stderr_result = unsafe { libc::dup2(null_fd, 2) };
+        unsafe { libc::close(null_fd); }
+        if stdout_result < 0 || stderr_result < 0 {
+            anyhow::bail!("Unable to redirect transaction output");
+        }
+        ACTIVE_TERM.with(|term| term.set(terminal as *mut _));
+        action()
     }
 
     // --- Finding Cached Versions for Downgrade ---
@@ -711,7 +1596,7 @@ impl App {
                                                 candidates.push(CachedVersionItem {
                                                     path: path.clone(),
                                                     version: loaded_pkg.version().as_str().to_string(),
-                                                    size: loaded_pkg.isize(),
+                                                    size: fs::metadata(&path).map(|metadata| metadata.len().min(i64::MAX as u64) as i64).unwrap_or(0),
                                                     build_date: loaded_pkg.build_date(),
                                                 });
                                             }
@@ -761,33 +1646,56 @@ impl App {
         lock_version: bool,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
-        check_and_clean_stale_lock();
+        check_database_lock(&self.alpm)?;
 
         let path_str = pkg_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid package path"))?;
         let pkg = self
             .alpm
-            .pkg_load(path_str, true, SigLevel::NONE)
+            .pkg_load(path_str, true, self.alpm.local_file_siglevel())
             .map_err(|e| anyhow::anyhow!("Failed to load cached archive: {e:?}"))?;
 
         let pkg_name = pkg.name().to_string();
 
+        clear_question_refusals();
         self.alpm.trans_init(TransFlag::empty())?;
-        self.alpm
-            .trans_add_pkg(pkg)
-            .map_err(|e| anyhow::anyhow!("Failed to queue package for downgrade: {e:?}"))?;
+        let add_error = match self.alpm.trans_add_pkg(pkg) {
+            Ok(()) => None,
+            Err(err) => Some(format!("{err:?}")),
+        };
+        if let Some(message) = add_error {
+            let _ = self.alpm.trans_release();
+            anyhow::bail!("Failed to queue package for downgrade: {message}");
+        }
 
-        let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
+        let prep_res = self.alpm.trans_prepare().map_err(|err| {
+            with_question_refusals(format!("Downgrade dependency check failed: {err:?}"))
+        });
         if let Err(err_msg) = prep_res {
             let _ = self.alpm.trans_release();
             self.progress = None;
-            anyhow::bail!("Downgrade dependency check failed: {err_msg}");
+            anyhow::bail!("{err_msg}");
+        }
+        if let Some(details) = take_question_refusal_details() {
+            let _ = self.alpm.trans_release();
+            anyhow::bail!("Downgrade stopped: {details}");
+        }
+
+        if let Err(err) = self.update_progress(
+            terminal,
+            "Downgrading Package",
+            &pkg_name,
+            "Committing the verified cached archive...",
+            50,
+        ) {
+            let _ = self.alpm.trans_release();
+            self.progress = None;
+            return Err(err);
         }
 
         let commit_result = Self::commit_in_tui(terminal, "Downgrading Package", || {
             self.alpm
                 .trans_commit()
-                .map_err(|e| anyhow::anyhow!("Downgrade commit failed: {e:?}"))
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("Downgrade commit failed: {err:?}"))))
         });
 
         if let Err(e) = commit_result {
@@ -797,17 +1705,78 @@ impl App {
         }
 
         self.alpm.trans_release()?;
+        self.progress = None;
 
-        if lock_version {
-            self.locked_pkgs.insert(pkg_name.clone());
-            let _ = self.alpm.add_ignorepkg(pkg_name.as_str());
-            let _ = self.save_locked_packages();
-        }
+        let lock_error = if lock_version
+            && self
+                .pacman_conf_ignored_pkgs
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, &pkg_name))
+        {
+            // pacman.conf already owns this exclusion; do not duplicate it in APC's file.
+            None
+        } else if lock_version {
+            let previous_locked = self.locked_pkgs.clone();
+            let mut next_locked = previous_locked.clone();
+            next_locked.insert(pkg_name.clone());
+
+            let previous_ignorepkgs: Vec<String> = self
+                .alpm
+                .ignorepkgs()
+                .iter()
+                .map(str::to_string)
+                .collect();
+            let next_ignorepkgs = updated_ignore_packages(
+                &previous_ignorepkgs,
+                &previous_locked,
+                &next_locked,
+                &self.pacman_conf_ignored_pkgs,
+            );
+
+            match self.save_locked_packages(&next_locked) {
+                Err(err) => Some(format!(
+                    "Downgrade succeeded, but the package lock could not be saved: {err}"
+                )),
+                Ok(()) => {
+                    match apply_ignorepkgs_verified(&mut self.alpm, &next_ignorepkgs) {
+                        Ok(()) => {
+                            self.locked_pkgs = next_locked;
+                            None
+                        }
+                        Err(err) => {
+                            let file_rollback = self.save_locked_packages(&previous_locked);
+                            let alpm_rollback =
+                                apply_ignorepkgs_verified(&mut self.alpm, &previous_ignorepkgs);
+
+                            let mut message = format!(
+                                "Downgrade succeeded, but the package could not be locked in libalpm: {err}"
+                            );
+                            if let Err(rollback_err) = file_rollback {
+                                message.push_str(&format!(
+                                    "\nFailed to restore the previous managed IgnorePkg file: {rollback_err}"
+                                ));
+                            }
+                            if let Err(rollback_err) = alpm_rollback {
+                                message.push_str(&format!(
+                                    "\nFailed to restore libalpm's previous IgnorePkg list: {rollback_err}"
+                                ));
+                            }
+                            Some(message)
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         self.refresh_installed()?;
         self.downgrade_view = None;
         self.active_pane = ActivePane::Left;
         flush_events()?;
+        if let Some(message) = lock_error {
+            anyhow::bail!("{message}");
+        }
         Ok(())
     }
 
@@ -817,24 +1786,14 @@ impl App {
         reinstall: bool,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
-        check_and_clean_stale_lock();
+        check_database_lock(&self.alpm)?;
+        clear_question_refusals();
 
-        // Purge stale archives from global cache to avoid checksum collisions
-        let pkg_cache = Path::new("/var/cache/pacman/pkg");
-        if let Ok(entries) = fs::read_dir(pkg_cache) {
-            let prefixes: Vec<String> = targets.iter().map(|t| format!("{t}-")).collect();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if (name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz"))
-                        && prefixes.iter().any(|p| name.starts_with(p))
-                    {
-                        let _ = fs::remove_file(&path);
-                    }
-                }
-            }
+        if self.syncdbs_synced_without_upgrade {
+            anyhow::bail!("Package databases were synchronized separately. Run a full system upgrade (F6) before installing or reinstalling packages.");
         }
+
+        // Never delete package archives from configured caches during installation.
 
         let op_name = if reinstall { "Reinstalling Packages" } else { "Installing Packages" };
         let target_desc = targets.join(", ");
@@ -842,37 +1801,55 @@ impl App {
         self.update_progress(terminal, op_name, &target_desc, "Initializing ALPM transaction...", 15)?;
 
         let flags = if reinstall { TransFlag::empty() } else { TransFlag::NEEDED };
-        self.alpm.trans_init(flags)?;
+        if let Err(err) = self.alpm.trans_init(flags) {
+            self.progress = None;
+            return Err(err.into());
+        }
 
         for name in &targets {
             let mut found = false;
             for db in self.alpm.syncdbs() {
                 if let Ok(pkg) = db.pkg(name.as_str()) {
-                    self.alpm
-                        .trans_add_pkg(pkg)
-                        .map_err(|e| anyhow::anyhow!("Failed to add {name} to transaction: {e:?}"))?;
+                    if let Err(err) = self.alpm.trans_add_pkg(pkg) {
+                        let message = format!("{err:?}");
+                        let _ = self.alpm.trans_release();
+                        self.progress = None;
+                        anyhow::bail!("Failed to add {name} to transaction: {message}");
+                    }
                     found = true;
                     break;
                 }
             }
             if !found {
                 let _ = self.alpm.trans_release();
+                self.progress = None;
                 anyhow::bail!("Package not found in syncdbs: {name}");
             }
         }
 
-        self.update_progress(terminal, op_name, &target_desc, "Resolving dependencies & checking disk space...", 45)?;
-        let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
+        if let Err(err) = self.update_progress(terminal, op_name, &target_desc, "Resolving dependencies & checking disk space...", 45) {
+            let _ = self.alpm.trans_release();
+            self.progress = None;
+            return Err(err);
+        }
+        let prep_res = self.alpm.trans_prepare().map_err(|err| {
+            with_question_refusals(format!("Transaction prepare failed: {err:?}"))
+        });
         if let Err(err_msg) = prep_res {
             let _ = self.alpm.trans_release();
             self.progress = None;
-            anyhow::bail!("Transaction prepare failed: {err_msg}");
+            anyhow::bail!("{err_msg}");
+        }
+        if let Some(details) = take_question_refusal_details() {
+            let _ = self.alpm.trans_release();
+            self.progress = None;
+            anyhow::bail!("Install stopped: {details}");
         }
 
         let commit_result = Self::commit_in_tui(terminal, op_name, || {
             self.alpm
                 .trans_commit()
-                .map_err(|e| anyhow::anyhow!("Install commit failed: {e:?}"))
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("Install commit failed: {err:?}"))))
         });
 
         if let Err(err_msg) = commit_result {
@@ -893,50 +1870,32 @@ impl App {
 
     fn alpm_remove(
         &mut self,
-        targets: Vec<String>,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
-        check_and_clean_stale_lock();
-
-        let target_desc = targets.join(", ");
-
-        self.update_progress(terminal, "Deleting Packages", &target_desc, "Initializing removal transaction...", 15)?;
-        self.alpm.trans_init(TransFlag::RECURSE | TransFlag::UNNEEDED)?;
-
-        for name in &targets {
-            if let Ok(pkg) = self.alpm.localdb().pkg(name.as_str()) {
-                self.alpm
-                    .trans_remove_pkg(pkg)
-                    .map_err(|e| anyhow::anyhow!("Failed to mark {name} for removal: {e:?}"))?;
-            }
-        }
-
-        self.update_progress(terminal, "Deleting Packages", &target_desc, "Resolving dependency cascades (-Rns)...", 50)?;
-        let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
-        if let Err(err_msg) = prep_res {
+        if let Err(err) = self.update_progress(
+            terminal,
+            "Removing Packages",
+            "Prepared removal transaction",
+            "Committing the reviewed -Rns package set...",
+            50,
+        ) {
             let _ = self.alpm.trans_release();
             self.progress = None;
-            anyhow::bail!("Transaction prepare failed: {err_msg}");
+            return Err(err);
         }
-
-        let commit_result = Self::commit_in_tui(terminal, "Deleting Packages", || {
-            self.alpm
-                .trans_commit()
-                .map_err(|e| anyhow::anyhow!("Removal commit failed: {e:?}"))
+        let commit_result = Self::commit_in_tui(terminal, "Removing Packages", || {
+            self.alpm.trans_commit()
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("Removal commit failed: {err:?}"))))
         });
-
-        if let Err(err_msg) = commit_result {
-            let _ = self.alpm.trans_release();
-            self.progress = None;
-            return Err(err_msg);
+        let release_result = self.alpm.trans_release();
+        self.progress = None;
+        if let Err(err) = commit_result {
+            let _ = release_result;
+            return Err(err);
         }
-
-        self.alpm.trans_release()?;
+        release_result?;
         self.refresh_installed()?;
         self.left.tagged.clear();
-
-        self.progress = None;
         flush_events()?;
         Ok(())
     }
@@ -945,14 +1904,25 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
+        check_database_lock(&self.alpm)?;
         self.update_progress(terminal, "Syncing Databases", "Configured Mirrors", "Connecting to repository mirrors...", 20)?;
 
         self.update_progress(terminal, "Syncing Databases", "Core, Extra, Multilib", "Downloading repository databases...", 50)?;
-        let _ = self.alpm.syncdbs_mut().update(false);
+        self.mark_partial_upgrade_pending()?;
+        let update_result = Self::commit_in_tui(terminal, "Syncing Databases", || {
+            self.alpm.syncdbs_mut().update(false)
+                .map_err(|err| anyhow::anyhow!("Repository database synchronization failed: {err:?}"))
+        });
+        if let Err(err) = update_result {
+            self.progress = None;
+            return Err(err);
+        }
 
         self.update_progress(terminal, "Syncing Databases", "Local Indices", "Refreshing package lists...", 85)?;
-        self.refresh_available()?;
-        self.refresh_installed()?;
+        if let Err(err) = self.refresh_available().and_then(|_| self.refresh_installed()) {
+            self.progress = None;
+            return Err(err);
+        }
 
         self.update_progress(terminal, "Syncing Databases", "All Repositories", "Synchronization complete!", 100)?;
         thread::sleep(Duration::from_millis(300));
@@ -965,16 +1935,26 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
-        check_and_clean_stale_lock();
+        check_database_lock(&self.alpm)?;
 
         self.update_progress(terminal, "System Upgrade", "Repositories", "Synchronizing mirror databases...", 20)?;
-        let _ = self.alpm.syncdbs_mut().update(false);
-        self.refresh_available()?;
-        self.refresh_installed()?;
+        self.mark_partial_upgrade_pending()?;
+        let update_result = Self::commit_in_tui(terminal, "System Upgrade", || {
+            self.alpm.syncdbs_mut().update(false)
+                .map_err(|err| anyhow::anyhow!("Repository database synchronization failed: {err:?}"))
+        });
+        if let Err(err) = update_result {
+            self.progress = None;
+            return Err(err);
+        }
+        if let Err(err) = self.refresh_available().and_then(|_| self.refresh_installed()) {
+            self.progress = None;
+            return Err(err);
+        }
 
         self.update_progress(terminal, "System Upgrade", "Local Packages", "Calculating package updates and new dependencies...", 50)?;
 
+        clear_question_refusals();
         if let Err(e) = self.alpm.trans_init(TransFlag::empty()) {
             self.progress = None;
             anyhow::bail!("Failed to initialize transaction: {e:?}");
@@ -986,11 +1966,18 @@ impl App {
             anyhow::bail!("Sysupgrade calculation failed: {e:?}");
         }
 
-        let prep_res = self.alpm.trans_prepare().map_err(|e| format!("{e:?}"));
+        let prep_res = self.alpm.trans_prepare().map_err(|err| {
+            with_question_refusals(format!("Dependency resolution / prepare failed: {err:?}"))
+        });
         if let Err(err_msg) = prep_res {
             let _ = self.alpm.trans_release();
             self.progress = None;
-            anyhow::bail!("Dependency resolution / prepare failed: {err_msg}");
+            anyhow::bail!("{err_msg}");
+        }
+        if let Some(details) = take_question_refusal_details() {
+            let _ = self.alpm.trans_release();
+            self.progress = None;
+            anyhow::bail!("System upgrade stopped: {details}");
         }
 
         let mut updates = Vec::new();
@@ -999,11 +1986,11 @@ impl App {
 
         for pkg in self.alpm.trans_add() {
             let name = pkg.name().to_string();
-            if self.locked_pkgs.contains(&name) {
+            if self.is_package_locked(&name) {
                 continue;
             }
 
-            let size = pkg.isize();
+            let size = pkg.download_size();
             total_download_size += size;
             let is_new = self.alpm.localdb().pkg(name.as_str()).is_err();
 
@@ -1023,7 +2010,8 @@ impl App {
         self.progress = None;
 
         if updates.is_empty() && new_deps.is_empty() {
-            let _ = self.alpm.trans_release();
+            self.alpm.trans_release()?;
+            self.clear_partial_upgrade_pending()?;
             self.modal = Some(Modal::Message("Your system is already up to date! No updates available.".to_string()));
             return Ok(());
         }
@@ -1042,20 +2030,34 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::fs::File>>,
     ) -> Result<()> {
-        let _guard = RootGuard::acquire()?;
 
         self.system_upgrade_in_progress = true;
-        terminal.draw(|f| {
+        let progress = ProgressState {
+            title: "System Upgrade".to_string(),
+            target: "Selected system upgrade".to_string(),
+            step: "Committing the prepared package transaction...".to_string(),
+            percent: 50,
+        };
+        self.progress = Some(progress.clone());
+        ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some(progress));
+        if let Err(err) = terminal.draw(|f| {
             draw_ui(f, self);
             BACKGROUND_BUFFER.with(|buffer| {
                 *buffer.borrow_mut() = Some(f.buffer_mut().clone());
             });
-        })?;
+        }) {
+            self.system_upgrade_in_progress = false;
+            ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = None);
+            let _ = self.alpm.trans_release();
+            self.updates_view = None;
+            self.progress = None;
+            return Err(err.into());
+        }
 
         let commit_result = Self::commit_in_tui(terminal, "System Upgrade", || {
             self.alpm
                 .trans_commit()
-                .map_err(|e| anyhow::anyhow!("System upgrade commit failed: {e:?}"))
+                .map_err(|err| anyhow::anyhow!(with_question_refusals(format!("System upgrade commit failed: {err:?}"))))
         });
         self.system_upgrade_in_progress = false;
 
@@ -1066,7 +2068,9 @@ impl App {
             return Err(e);
         }
 
+        self.progress = None;
         self.alpm.trans_release()?;
+        self.clear_partial_upgrade_pending()?;
         self.refresh_installed()?;
         self.refresh_available()?;
         self.updates_view = None;
@@ -1076,9 +2080,14 @@ impl App {
 
     fn refresh_installed(&mut self) -> Result<()> {
         let mut installed = Vec::new();
+        let mut explicit_names = HashSet::new();
         for pkg in self.alpm.localdb().pkgs() {
+            let name = pkg.name().to_string();
+            if pkg.reason() == alpm::PackageReason::Explicit {
+                explicit_names.insert(name.clone());
+            }
             installed.push(PkgSummary {
-                name: pkg.name().to_string(),
+                name,
                 version: pkg.version().as_str().to_string(),
                 desc: pkg.desc().unwrap_or("").to_string(),
                 size: pkg.isize(),
@@ -1086,6 +2095,7 @@ impl App {
         }
         installed.sort_by(|a, b| a.name.cmp(&b.name));
         self.left.all_items = installed;
+        self.left.set_explicit_names(explicit_names);
         Ok(())
     }
 
@@ -1097,7 +2107,7 @@ impl App {
                     name: pkg.name().to_string(),
                     version: pkg.version().as_str().to_string(),
                     desc: pkg.desc().unwrap_or("").to_string(),
-                    size: pkg.isize(),
+                    size: pkg.size(),
                 });
             }
         }
@@ -1108,20 +2118,15 @@ impl App {
     }
 }
 
-fn check_and_clean_stale_lock() {
-    let lck_path = Path::new("/var/lib/pacman/db.lck");
-    if lck_path.exists() {
-        let is_running = std::process::Command::new("pgrep")
-            .arg("-x")
-            .arg("pacman")
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-
-        if !is_running {
-            let _ = fs::remove_file(lck_path);
-        }
+fn check_database_lock(alpm: &Alpm) -> Result<()> {
+    let lockfile = Path::new(alpm.lockfile());
+    if lockfile.exists() {
+        anyhow::bail!(
+            "The package database is locked by another package manager or an unfinished transaction: {}. Do not delete this lock automatically; verify that no package operation is running first.",
+            lockfile.display()
+        );
     }
+    Ok(())
 }
 
 fn flush_events() -> Result<()> {
@@ -1360,7 +2365,7 @@ fn draw_pane(
             let size_mib = pkg.size as f64 / (1024.0 * 1024.0);
 
             let row_text = if is_left_pane {
-                let lock_mark = if app.locked_pkgs.contains(&pkg.name) { "\u{f023} " } else { "  " };
+                let lock_mark = if app.is_package_locked(&pkg.name) { "\u{f023} " } else { "  " };
                 format!(
                     "{}{}{:<name_w$} {:<14} {:>7.2}M",
                     tag_mark,
@@ -1394,7 +2399,7 @@ fn draw_pane(
                         .fg(NC_YELLOW)
                         .add_modifier(Modifier::BOLD),
                 )
-            } else if is_left_pane && app.locked_pkgs.contains(&pkg.name) {
+            } else if is_left_pane && app.is_package_locked(&pkg.name) {
                 ListItem::new(row_text).style(
                     Style::default()
                         .fg(NC_YELLOW),
@@ -1495,8 +2500,19 @@ fn draw_bottom_bar(f: &mut Frame, area: Rect, active: ActivePane, app: &App) {
         return;
     }
 
-    let is_cur_locked = app.left.current_pkg().map(|p| app.locked_pkgs.contains(&p.name)).unwrap_or(false);
-    let lock_label = if is_cur_locked { "Unlock" } else { "Lock" };
+    let current_pkg = app.left.current_pkg();
+    let lock_label = match current_pkg {
+        Some(pkg)
+            if app
+                .pacman_conf_ignored_pkgs
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, &pkg.name)) =>
+        {
+            "Config"
+        },
+        Some(pkg) if app.locked_pkgs.contains(&pkg.name) => "Unlock",
+        _ => "Lock",
+    };
 
     let f_keys = match active {
         ActivePane::Left => {
@@ -1508,6 +2524,7 @@ fn draw_bottom_bar(f: &mut Frame, area: Rect, active: ActivePane, app: &App) {
                     ("F4", lock_label),
                     ("F5", "Down"),
                     ("F6", "Upd"),
+                    ("F7", "Scope"),
                     ("F8", "Del"),
                     ("F9", "Sync"),
                     ("F10", "Quit"),
@@ -1520,6 +2537,7 @@ fn draw_bottom_bar(f: &mut Frame, area: Rect, active: ActivePane, app: &App) {
                     ("F4", lock_label),
                     ("F5", "Downgrade"),
                     ("F6", "UpdSys"),
+                    ("F7", "Scope"),
                     ("F8", "Delete"),
                     ("F9", "SyncDB"),
                     ("F10", "Quit"),
@@ -1571,8 +2589,8 @@ fn draw_dialog_box(f: &mut Frame, width: u16, height: u16) -> Rect {
     let y = (screen.height.saturating_sub(h)) / 2;
 
     let shadow_rect = Rect {
-        x: (x + 2).min(screen.width - 1),
-        y: (y + 1).min(screen.height - 1),
+        x: (x + 2).min(screen.width.saturating_sub(1)),
+        y: (y + 1).min(screen.height.saturating_sub(1)),
         width: w.min(screen.width.saturating_sub(x + 2)),
         height: h.min(screen.height.saturating_sub(y + 1)),
     };
@@ -1584,7 +2602,7 @@ fn draw_dialog_box(f: &mut Frame, width: u16, height: u16) -> Rect {
 }
 
 fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
-    let dialog_rect = draw_dialog_box(f, 70, 16);
+    let dialog_rect = draw_dialog_box(f, 70, 18);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1605,7 +2623,7 @@ fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
     let size_mib = diag.total_size as f64 / (1024.0 * 1024.0);
 
     let (prompt_text, action_color, size_label) = match diag.action {
-        DialogAction::Delete(_) => (
+        DialogAction::Delete => (
             "You are about to delete:",
             Color::Red,
             format!("Total space to free: {:.2} MiB", size_mib),
@@ -1633,16 +2651,23 @@ fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
         Line::from(Span::styled(format!("  • {}", targets_preview), Style::default().fg(action_color).add_modifier(Modifier::BOLD))),
     ];
 
-    if !diag.cascade.is_empty() {
-        let cascade_preview = if diag.cascade.len() > 5 {
-            format!("{} (+{} more)", diag.cascade[..5].join(", "), diag.cascade.len() - 5)
+    if !diag.additional_removals.is_empty() {
+        let removal_preview = if diag.additional_removals.len() > 5 {
+            format!("{} (+{} more)", diag.additional_removals[..5].join(", "), diag.additional_removals.len() - 5)
         } else {
-            diag.cascade.join(", ")
+            diag.additional_removals.join(", ")
         };
         lines.push(Line::from(""));
-        let sub_title = "Dependent packages that will also be removed:";
+        let sub_title = "Additional packages removed by the prepared -Rns transaction:";
         lines.push(Line::from(Span::styled(sub_title, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
-        lines.push(Line::from(Span::styled(format!("  • {}", cascade_preview), Style::default().fg(NC_BLACK))));
+        lines.push(Line::from(Span::styled(format!("  • {}", removal_preview), Style::default().fg(NC_BLACK))));
+    }
+    if !diag.hold_packages.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("HoldPkg warning: {}", diag.hold_packages.join(", ")),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
     }
 
     lines.push(Line::from(""));
@@ -1679,8 +2704,8 @@ fn draw_confirmation_dialog(f: &mut Frame, diag: &ConfirmationDialog) {
     f.render_widget(p, dialog_rect);
 }
 
-fn draw_progress_dialog(f: &mut Frame, prog: &ProgressState) {
-    let dialog_rect = draw_dialog_box(f, 62, 11);
+fn draw_progress_dialog(f: &mut Frame, prog: &ProgressState, state: &PackageProgressState) {
+    let dialog_rect = draw_dialog_box(f, 72, 14);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1697,7 +2722,7 @@ fn draw_progress_dialog(f: &mut Frame, prog: &ProgressState) {
     let empty = gauge_width - filled;
     let bar_str = format!("[{}{}] {}%", "█".repeat(filled), "░".repeat(empty), prog.percent);
 
-    let text = vec![
+    let mut text = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("Target : ", Style::default().fg(NC_CYAN)),
@@ -1710,6 +2735,45 @@ fn draw_progress_dialog(f: &mut Frame, prog: &ProgressState) {
         Line::from(""),
         Line::from(Span::styled(bar_str, Style::default().fg(NC_CYAN).add_modifier(Modifier::BOLD))),
     ];
+
+    if let Some(active) = state.active_package.as_deref() {
+        let percent = state.packages.iter()
+            .find(|item| item.name == active)
+            .map(|item| item.percent)
+            .unwrap_or(state.overall_percent);
+        text.push(Line::from(Span::styled(
+            format!("Package: {active} ({percent}%)"),
+            Style::default().fg(NC_YELLOW),
+        )));
+        text.push(Line::from(Span::styled(
+            format!("Package operations: {}%", state.overall_percent),
+            Style::default().fg(NC_WHITE),
+        )));
+    }
+    if let Some(filename) = state.active_download.as_deref() {
+        let file_percent = state.downloads.iter()
+            .find(|item| item.name == filename)
+            .map(|item| item.percent)
+            .unwrap_or(state.download_percent);
+        text.push(Line::from(Span::styled(
+            format!("Download: {filename} ({file_percent}%)"),
+            Style::default().fg(NC_CYAN),
+        )));
+        if state.total_download_bytes > 0 {
+            text.push(Line::from(Span::styled(
+                format!("All downloads: {}%", state.download_percent),
+                Style::default().fg(NC_WHITE),
+            )));
+            text.push(Line::from(Span::styled(
+                format!(
+                    "Downloaded: {:.1} / {:.1} MiB",
+                    state.downloaded_bytes.max(0) as f64 / (1024.0 * 1024.0),
+                    state.total_download_bytes.max(0) as f64 / (1024.0 * 1024.0),
+                ),
+                Style::default().fg(NC_WHITE),
+            )));
+        }
+    }
 
     let p = Paragraph::new(text).block(block).alignment(Alignment::Center);
     f.render_widget(p, dialog_rect);
@@ -1741,10 +2805,11 @@ fn draw_help_dialog(f: &mut Frame) {
         ("F1", "Show this Help table"),
         ("F2", "Reinstall selected package(s)"),
         ("F3", "Quick View package info in opposite pane"),
-        ("F4", "Lock / Unlock package version (\u{f023} via /etc/pacman.d/IgnorePkg)"),
+        ("F4", "Lock / Unlock APC-managed package versions; pacman.conf exclusions are untouched"),
         ("F5", "Downgrade from cache (Left) / Install (Right)"),
         ("F6", "Update system (ALPM equivalent of pacman -Syu)"),
-        ("F8", "Delete selected package(s) (-Rns cascade)"),
+        ("F7", "Toggle installed scope (Explicit ⇄ All installed)"),
+        ("F8", "Remove packages safely (-Rns)"),
         ("F9", "Synchronize databases (pure libalpm)"),
         ("F10", "Quit Arch Package Commander"),
     ];
@@ -1815,10 +2880,15 @@ fn draw_ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[0]);
 
+    let installed_title = if app.left.show_all_items {
+        "Installed Packages (All)"
+    } else {
+        "Installed Packages (Explicit)"
+    };
     draw_pane(
         f,
         pane_chunks[0],
-        "Installed Packages",
+        installed_title,
         &app.left,
         app.active_pane == ActivePane::Left,
         true,
@@ -1844,7 +2914,11 @@ fn draw_ui(f: &mut Frame, app: &App) {
             Modal::Message(msg) => draw_message_dialog(f, msg),
         }
     } else if let Some(ref prog) = app.progress {
-        draw_progress_dialog(f, prog);
+        let package_progress = PACKAGE_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        draw_progress_dialog(f, prog, &package_progress);
     }
 }
 
@@ -1858,27 +2932,20 @@ fn main() -> Result<()> {
             .arg(current_exe)
             .args(&args)
             .status()?;
-        std::process::exit(status.code().unwrap_or(0));
+        std::process::exit(status.code().unwrap_or(1));
     }
 
-    check_and_clean_stale_lock();
-
-    let mut app = match App::new() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Failed to initialize ALPM: {e}");
-            return Ok(());
-        }
-    };
+    let mut app = App::new()?;
 
     let tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")?;
 
+    let cleanup_tty = tty.try_clone()?;
     enable_raw_mode()?;
-    let mut tty_clone = tty.try_clone()?;
-    execute!(tty_clone, EnterAlternateScreen)?;
+    let mut terminal_guard = TerminalGuard { tty: cleanup_tty };
+    execute!(&mut terminal_guard.tty, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(tty);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1929,13 +2996,16 @@ fn main() -> Result<()> {
                             app.modal = Some(modal);
                         }
                         KeyCode::Enter => {
-                            let action = std::mem::replace(&mut diag.action, DialogAction::Delete(Vec::new()));
+                            let action = std::mem::replace(&mut diag.action, DialogAction::Delete);
                             match action {
-                                DialogAction::Delete(targets) => {
+                                DialogAction::Delete => {
                                     if diag.selected_button == 0 {
-                                        if let Err(e) = app.alpm_remove(targets, &mut terminal) {
+                                        if let Err(e) = app.alpm_remove(&mut terminal) {
                                             app.modal = Some(Modal::Message(format!("Error: {e}")));
                                         }
+                                    } else {
+                                        let _ = app.alpm.trans_release();
+                                        app.progress = None;
                                     }
                                 }
                                 DialogAction::Install(targets) => {
@@ -1967,7 +3037,12 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
-                        KeyCode::Esc => {}
+                        KeyCode::Esc => {
+                            if matches!(&diag.action, DialogAction::Delete) {
+                                let _ = app.alpm.trans_release();
+                                app.progress = None;
+                            }
+                        }
                         _ => {
                             app.modal = Some(modal);
                         }
@@ -2012,9 +3087,10 @@ fn main() -> Result<()> {
                                 app.modal = Some(Modal::Confirm(ConfirmationDialog {
                                     title: "Downgrade".to_string(),
                                     packages: vec![dg.installed_version.clone()],
-                                    cascade: Vec::new(),
+                                    additional_removals: Vec::new(),
+                                    hold_packages: Vec::new(),
                                     total_size: sel.size,
-                                    selected_button: 0,
+                                    selected_button: 1,
                                     button_labels: vec![
                                         "Downgrade & Lock".to_string(),
                                         "Downgrade".to_string(),
@@ -2132,16 +3208,7 @@ fn main() -> Result<()> {
                         };
 
                         if !targets.is_empty() {
-                            let (cascade, total_size) = app.get_removal_cascade(&targets);
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Delete".to_string(),
-                                packages: targets.clone(),
-                                cascade,
-                                total_size,
-                                selected_button: 0,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Delete(targets),
-                            }));
+                            app.open_removal_confirmation(targets);
                         }
                     } else {
                         let targets: Vec<String> = if !app.right.tagged.is_empty() {
@@ -2152,21 +3219,7 @@ fn main() -> Result<()> {
                             vec![]
                         };
 
-                        if !targets.is_empty() {
-                            let total_size: i64 = targets.iter().filter_map(|t| {
-                                app.right.all_items.iter().find(|p| &p.name == t).map(|p| p.size)
-                            }).sum();
-
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Install".to_string(),
-                                packages: targets.clone(),
-                                cascade: Vec::new(),
-                                total_size,
-                                selected_button: 0,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Install(targets),
-                            }));
-                        }
+                        app.open_install_confirmation(targets, false);
                     }
                 }
                 KeyCode::F(1) => {
@@ -2182,21 +3235,7 @@ fn main() -> Result<()> {
                             vec![]
                         };
 
-                        if !targets.is_empty() {
-                            let total_size: i64 = targets.iter().filter_map(|t| {
-                                app.left.all_items.iter().find(|p| &p.name == t).map(|p| p.size)
-                            }).sum();
-
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Reinstall".to_string(),
-                                packages: targets.clone(),
-                                cascade: Vec::new(),
-                                total_size,
-                                selected_button: 0,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Reinstall(targets),
-                            }));
-                        }
+                        app.open_install_confirmation(targets, true);
                     }
                 }
                 KeyCode::F(3) => {
@@ -2223,26 +3262,17 @@ fn main() -> Result<()> {
                             vec![]
                         };
 
-                        if !targets.is_empty() {
-                            let total_size: i64 = targets.iter().filter_map(|t| {
-                                app.right.all_items.iter().find(|p| &p.name == t).map(|p| p.size)
-                            }).sum();
-
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Install".to_string(),
-                                packages: targets.clone(),
-                                cascade: Vec::new(),
-                                total_size,
-                                selected_button: 0,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Install(targets),
-                            }));
-                        }
+                        app.open_install_confirmation(targets, false);
                     }
                 }
                 KeyCode::F(6) => {
                     if let Err(e) = app.alpm_check_system_upgrade(&mut terminal) {
                         app.modal = Some(Modal::Message(format!("Update Check Failed: {e}")));
+                    }
+                }
+                KeyCode::F(7) => {
+                    if app.active_pane == ActivePane::Left {
+                        app.left.toggle_installed_scope();
                     }
                 }
                 KeyCode::F(8) => {
@@ -2256,16 +3286,7 @@ fn main() -> Result<()> {
                         };
 
                         if !targets.is_empty() {
-                            let (cascade, total_size) = app.get_removal_cascade(&targets);
-                            app.modal = Some(Modal::Confirm(ConfirmationDialog {
-                                title: "Delete".to_string(),
-                                packages: targets.clone(),
-                                cascade,
-                                total_size,
-                                selected_button: 0,
-                                button_labels: vec!["Proceed".to_string(), "Cancel".to_string()],
-                                action: DialogAction::Delete(targets),
-                            }));
+                            app.open_removal_confirmation(targets);
                         }
                     }
                 }
@@ -2277,7 +3298,7 @@ fn main() -> Result<()> {
                 KeyCode::F(10) => {
                     app.should_quit = true;
                 }
-                KeyCode::Char(c) if c.is_alphanumeric() || matches!(c, '-' | '_' | '+' | '.' | '@' | ':') => {
+                KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && (c.is_alphanumeric() || matches!(c, '-' | '_' | '+' | '.' | '@' | ':')) => {
                     let cur = match app.active_pane {
                         ActivePane::Left => &mut app.left,
                         ActivePane::Right => &mut app.right,
@@ -2290,7 +3311,545 @@ fn main() -> Result<()> {
         }
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn summary(name: &str) -> PkgSummary {
+        PkgSummary { name: name.to_string(), version: "1-1".to_string(), desc: String::new(), size: 1 }
+    }
+    #[test]
+    fn tagged_packages_remain_visible_under_filter() {
+        let mut pane = PaneState::new(vec![summary("bash"), summary("linux"), summary("vim")]);
+        pane.tagged.insert("linux".to_string());
+        pane.filter = "vim".to_string();
+        let names: Vec<&str> = pane.filtered().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["linux", "vim"]);
+    }
+    #[test]
+    fn installed_pane_defaults_to_explicit_and_can_show_all_installed() {
+        let mut pane = PaneState::new_installed(vec![
+            summary("bash"),
+            summary("linux"),
+            summary("vim"),
+        ]);
+        pane.set_explicit_names(
+            ["bash", "vim"].into_iter().map(str::to_string).collect(),
+        );
+
+        let names: Vec<&str> = pane.filtered().iter().map(|pkg| pkg.name.as_str()).collect();
+        assert_eq!(names, vec!["bash", "vim"]);
+
+        pane.toggle_installed_scope();
+        let names: Vec<&str> = pane.filtered().iter().map(|pkg| pkg.name.as_str()).collect();
+        assert_eq!(names, vec!["bash", "linux", "vim"]);
+    }
+
+    #[test]
+    fn switching_back_to_explicit_scope_clears_hidden_dependency_tags() {
+        let mut pane = PaneState::new_installed(vec![
+            summary("bash"),
+            summary("linux"),
+            summary("vim"),
+        ]);
+        pane.set_explicit_names(
+            ["bash", "vim"].into_iter().map(str::to_string).collect(),
+        );
+        pane.toggle_installed_scope();
+        pane.tagged.insert("linux".to_string());
+
+        pane.toggle_installed_scope();
+
+        assert!(!pane.tagged.contains("linux"));
+        let names: Vec<&str> = pane.filtered().iter().map(|pkg| pkg.name.as_str()).collect();
+        assert_eq!(names, vec!["bash", "vim"]);
+    }
+
+    #[test]
+    fn epoch_date_handles_unix_epoch_and_negative_days() {
+        assert_eq!(format_epoch_date(0), "1970-01-01");
+        assert_eq!(format_epoch_date(86_400), "1970-01-02");
+        assert_eq!(format_epoch_date(-86_400), "1969-12-31");
+    }
+    #[test]
+    fn hold_package_patterns_support_globs() {
+        assert!(wildcard_matches("linux*", "linux-lts"));
+        assert!(wildcard_matches("lib?lpm", "libalpm"));
+        assert!(!wildcard_matches("linux", "linux-lts"));
+        assert!(is_hold_package("glibc", &["glib*".to_string()]));
+    }
+    #[test]
+    fn siglevel_parser_preserves_global_defaults_and_applies_repo_overrides() {
+        let base = SigLevel::PACKAGE | SigLevel::DATABASE;
+        let parsed = parse_siglevel(&["DatabaseOptional".to_string()], base).unwrap();
+        assert!(parsed.contains(SigLevel::PACKAGE));
+        assert!(!parsed.contains(SigLevel::PACKAGE_OPTIONAL));
+        assert!(!parsed.contains(SigLevel::DATABASE));
+        assert!(parsed.contains(SigLevel::DATABASE_OPTIONAL));
+
+        let combined = parse_siglevel(
+            &["Required DatabaseOptional TrustedOnly".to_string()],
+            SigLevel::NONE,
+        ).unwrap();
+        assert!(combined.contains(SigLevel::PACKAGE));
+        assert!(!combined.contains(SigLevel::PACKAGE_OPTIONAL));
+        assert!(!combined.contains(SigLevel::DATABASE));
+        assert!(combined.contains(SigLevel::DATABASE_OPTIONAL));
+
+        let package_optional =
+            parse_siglevel(&["PackageOptional".to_string()], SigLevel::NONE).unwrap();
+        assert!(!package_optional.contains(SigLevel::PACKAGE));
+        assert!(package_optional.contains(SigLevel::PACKAGE_OPTIONAL));
+        assert!(!package_optional.contains(SigLevel::DATABASE));
+        assert!(!package_optional.contains(SigLevel::DATABASE_OPTIONAL));
+
+        let global_optional =
+            parse_siglevel(&["Optional".to_string()], SigLevel::PACKAGE | SigLevel::DATABASE).unwrap();
+        assert!(!global_optional.contains(SigLevel::PACKAGE));
+        assert!(global_optional.contains(SigLevel::PACKAGE_OPTIONAL));
+        assert!(!global_optional.contains(SigLevel::DATABASE));
+        assert!(global_optional.contains(SigLevel::DATABASE_OPTIONAL));
+
+        let required_after_optional = parse_siglevel(
+            &["PackageOptional PackageRequired".to_string()],
+            SigLevel::NONE,
+        ).unwrap();
+        assert!(required_after_optional.contains(SigLevel::PACKAGE));
+        assert!(!required_after_optional.contains(SigLevel::PACKAGE_OPTIONAL));
+
+        let optional_after_required = parse_siglevel(
+            &["PackageRequired PackageOptional".to_string()],
+            SigLevel::NONE,
+        ).unwrap();
+        assert!(!optional_after_required.contains(SigLevel::PACKAGE));
+        assert!(optional_after_required.contains(SigLevel::PACKAGE_OPTIONAL));
+
+        let never = parse_siglevel(&["Never".to_string()], SigLevel::PACKAGE | SigLevel::DATABASE).unwrap();
+        assert!(!never.contains(SigLevel::PACKAGE));
+        assert!(!never.contains(SigLevel::PACKAGE_OPTIONAL));
+        assert!(!never.contains(SigLevel::DATABASE));
+        assert!(!never.contains(SigLevel::DATABASE_OPTIONAL));
+    }
+    #[test]
+    fn pacman_conf_ignore_packages_are_separated_from_apc_managed_entries() {
+        let configured = vec![
+            "linux linux-lts".to_string(),
+            "mesa systemd".to_string(),
+            "linux".to_string(),
+        ];
+        let managed: HashSet<String> = ["linux", "mesa"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let external = parse_external_ignore_packages(&configured, &managed, true);
+        assert_eq!(
+            external,
+            ["linux", "linux-lts", "systemd"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert!(external.iter().any(|pattern| wildcard_matches(pattern, "linux")));
+    }
+
+    #[test]
+    fn external_ignore_packages_remain_external_when_managed_file_is_not_included() {
+        let configured = vec!["linux linux-lts".to_string()];
+        let managed: HashSet<String> = ["linux"].into_iter().map(str::to_string).collect();
+
+        assert_eq!(
+            parse_external_ignore_packages(&configured, &managed, false),
+            ["linux", "linux-lts"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn managed_ignore_file_include_detection_handles_globs_and_nested_includes() {
+        let root = std::env::temp_dir().join(format!("apc-include-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("conf.d")).unwrap();
+        fs::write(root.join("IgnorePkg"), "IgnorePkg = linux\n").unwrap();
+        fs::write(
+            root.join("pacman.conf"),
+            "[options]\nInclude = conf.d/*.conf\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("conf.d/managed.conf"),
+            "Include = ../IgnorePkg\n",
+        )
+        .unwrap();
+
+        assert!(config_includes_file(
+            &root.join("pacman.conf"),
+            &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
+        ));
+
+        fs::write(
+            root.join("pacman.conf"),
+            "[options]\nInclude = conf.d/other.conf\n",
+        )
+        .unwrap();
+        fs::write(root.join("conf.d/other.conf"), "Color\n").unwrap();
+        assert!(!config_includes_file(
+            &root.join("pacman.conf"),
+            &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
+        ));
+
+        fs::write(
+            root.join("pacman.conf"),
+            "[core]\nInclude = IgnorePkg\n",
+        )
+        .unwrap();
+        assert!(!config_includes_file(
+            &root.join("pacman.conf"),
+            &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
+        ));
+
+        fs::write(
+            root.join("pacman.conf"),
+            "[options]\nInclude = conf.d/*.conf\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("conf.d/managed.conf"),
+            "[core]\nInclude = ../IgnorePkg\n",
+        )
+        .unwrap();
+        assert!(!config_includes_file(
+            &root.join("pacman.conf"),
+            &fs::canonicalize(root.join("IgnorePkg")).unwrap(),
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignorepkg_list_verification_ignores_order_and_duplicates() {
+        let actual = vec!["linux".to_string(), "external-*".to_string(), "linux".to_string()];
+        let expected = vec!["external-*".to_string(), "linux".to_string()];
+        assert!(ignorepkg_lists_match(&actual, &expected));
+        assert!(!ignorepkg_lists_match(&actual, &["linux".to_string()]));
+    }
+
+    #[test]
+    fn updating_ignore_packages_preserves_external_entries_and_replaces_managed_entries() {
+        let current = vec![
+            "external-*".to_string(),
+            "old-managed".to_string(),
+            "keep-managed".to_string(),
+        ];
+        let previous_managed: HashSet<String> = ["old-managed", "keep-managed"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let next_managed: HashSet<String> = ["new-managed", "external-covered"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let external: HashSet<String> = ["external-*".to_string()].into_iter().collect();
+
+        assert_eq!(
+            updated_ignore_packages(&current, &previous_managed, &next_managed, &external),
+            vec!["external-*".to_string(), "new-managed".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignorepkg_state_does_not_touch_alpm_when_initial_persistence_fails() {
+        use std::cell::Cell;
+
+        let previous_managed: HashSet<String> = ["old-lock"].into_iter().map(str::to_string).collect();
+        let next_managed: HashSet<String> = ["new-lock"].into_iter().map(str::to_string).collect();
+        let apply_calls = Cell::new(0);
+
+        let result = update_ignorepkg_state(
+            &previous_managed,
+            &next_managed,
+            &["old-lock".to_string()],
+            &["new-lock".to_string()],
+            |_| anyhow::bail!("injected initial persistence failure"),
+            |_| {
+                apply_calls.set(apply_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(result.unwrap_err().to_string().contains("injected initial persistence failure"));
+        assert_eq!(apply_calls.get(), 0);
+    }
+
+    #[test]
+    fn ignorepkg_state_restores_file_and_alpm_after_apply_failure() {
+        use std::cell::RefCell;
+
+        let previous_managed: HashSet<String> = ["old-lock"].into_iter().map(str::to_string).collect();
+        let next_managed: HashSet<String> = ["new-lock"].into_iter().map(str::to_string).collect();
+        let persisted = RefCell::new(previous_managed.clone());
+        let live = RefCell::new(vec!["old-lock".to_string()]);
+
+        let result = update_ignorepkg_state(
+            &previous_managed,
+            &next_managed,
+            &["old-lock".to_string()],
+            &["new-lock".to_string()],
+            |locked| {
+                *persisted.borrow_mut() = locked.clone();
+                Ok(())
+            },
+            |packages| {
+                if packages == ["new-lock"] {
+                    anyhow::bail!("injected ALPM update failure");
+                }
+                *live.borrow_mut() = packages.to_vec();
+                Ok(())
+            },
+        );
+
+        assert!(result.unwrap_err().to_string().contains("injected ALPM update failure"));
+        assert_eq!(*persisted.borrow(), previous_managed);
+        assert_eq!(*live.borrow(), vec!["old-lock".to_string()]);
+    }
+
+    #[test]
+    fn ignorepkg_state_reports_file_rollback_failure() {
+        use std::cell::{Cell, RefCell};
+
+        let previous_managed: HashSet<String> = ["old-lock"].into_iter().map(str::to_string).collect();
+        let next_managed: HashSet<String> = ["new-lock"].into_iter().map(str::to_string).collect();
+        let persisted = RefCell::new(previous_managed.clone());
+        let persist_calls = Cell::new(0);
+        let live = RefCell::new(vec!["old-lock".to_string()]);
+
+        let result = update_ignorepkg_state(
+            &previous_managed,
+            &next_managed,
+            &["old-lock".to_string()],
+            &["new-lock".to_string()],
+            |locked| {
+                let call = persist_calls.get() + 1;
+                persist_calls.set(call);
+                if call == 2 {
+                    anyhow::bail!("injected file rollback failure");
+                }
+                *persisted.borrow_mut() = locked.clone();
+                Ok(())
+            },
+            |packages| {
+                if packages == ["new-lock"] {
+                    anyhow::bail!("injected ALPM update failure");
+                }
+                *live.borrow_mut() = packages.to_vec();
+                Ok(())
+            },
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("injected ALPM update failure"));
+        assert!(error.contains("Failed to restore the previous managed IgnorePkg file"));
+        assert!(error.contains("injected file rollback failure"));
+        assert_eq!(*persisted.borrow(), next_managed);
+        assert_eq!(*live.borrow(), vec!["old-lock".to_string()]);
+    }
+
+    #[test]
+    fn ignorepkg_state_reports_alpm_rollback_failure() {
+        use std::cell::RefCell;
+
+        let previous_managed: HashSet<String> = ["old-lock"].into_iter().map(str::to_string).collect();
+        let next_managed: HashSet<String> = ["new-lock"].into_iter().map(str::to_string).collect();
+        let persisted = RefCell::new(previous_managed.clone());
+
+        let result = update_ignorepkg_state(
+            &previous_managed,
+            &next_managed,
+            &["old-lock".to_string()],
+            &["new-lock".to_string()],
+            |locked| {
+                *persisted.borrow_mut() = locked.clone();
+                Ok(())
+            },
+            |packages| {
+                if packages == ["new-lock"] {
+                    anyhow::bail!("injected ALPM update failure");
+                }
+                anyhow::bail!("injected ALPM rollback failure");
+            },
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("injected ALPM update failure"));
+        assert!(error.contains("Failed to restore libalpm's previous IgnorePkg list"));
+        assert!(error.contains("injected ALPM rollback failure"));
+        assert_eq!(*persisted.borrow(), previous_managed);
+    }
+
+    #[test]
+    fn atomic_file_replacement_replaces_contents_and_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("apc-atomic-write-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("IgnorePkg");
+        fs::write(&target, "IgnorePkg = old\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+
+        atomic_replace_file(&target, b"IgnorePkg = new\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "IgnorePkg = new\n");
+        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o7777, 0o640);
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+            entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_file_replacement_keeps_existing_symlink_and_replaces_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("apc-atomic-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("managed.conf");
+        let link = root.join("IgnorePkg");
+        fs::write(&target, "IgnorePkg = old\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        atomic_replace_file(&link, b"IgnorePkg = new\n").unwrap();
+
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "IgnorePkg = new\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_file_replacement_failure_preserves_target_and_cleans_temporary_file() {
+        let root = std::env::temp_dir().join(format!("apc-atomic-failure-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target-dir");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), "original").unwrap();
+
+        assert!(atomic_replace_file(&target, b"replacement").is_err());
+        assert!(target.is_dir());
+        assert_eq!(fs::read_to_string(target.join("keep")).unwrap(), "original");
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.contains(".apc-") && name.ends_with(".tmp")
+        }));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_file_replacement_rejects_dangling_symlink_without_removing_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("apc-atomic-dangling-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let link = root.join("IgnorePkg");
+        symlink(root.join("missing-target"), &link).unwrap();
+
+        assert!(atomic_replace_file(&link, b"replacement").is_err());
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(!root.join("missing-target").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_ignore_file_parser_reads_only_ignorepkg_entries() {
+        let parsed = parse_managed_ignore_pkg(
+            "# APC-managed locks\nIgnorePkg = linux mesa\nNoUpgrade = /etc/example\n",
+        );
+        assert_eq!(
+            parsed,
+            ["linux", "mesa"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn managed_wildcard_patterns_lock_all_matching_packages() {
+        let managed = parse_managed_ignore_pkg(
+            "# APC-managed locks\nIgnorePkg = linux-firmware* bash\n",
+        );
+
+        for name in [
+            "linux-firmware-amdgpu",
+            "linux-firmware-intel",
+            "linux-firmware-realtek",
+            "linux-firmware-whence",
+        ] {
+            assert!(package_matches_patterns(name, &managed), "{name} should be locked");
+            assert!(is_managed_wildcard_lock(name, &managed), "{name} should be covered by the wildcard");
+        }
+
+        assert!(package_matches_patterns("bash", &managed));
+        assert!(!is_managed_wildcard_lock("bash", &managed));
+        assert!(!package_matches_patterns("linux", &managed));
+    }
+
+    #[test]
+    fn wildcard_unlock_requires_every_matching_installed_package() {
+        let installed = vec![
+            summary("linux-firmware-amdgpu"),
+            summary("linux-firmware-intel"),
+            summary("linux-firmware-realtek"),
+            summary("linux-firmware-whence"),
+            summary("bash"),
+        ];
+        let patterns: HashSet<String> = ["linux-firmware*".to_string()].into_iter().collect();
+        let all_targets: Vec<String> = installed[..4].iter().map(|pkg| pkg.name.clone()).collect();
+
+        assert_eq!(
+            managed_wildcard_patterns_to_remove(&all_targets, &installed, &patterns).unwrap(),
+            patterns
+        );
+
+        for selected_count in [1, 3] {
+            let partial: Vec<String> = installed[..selected_count]
+                .iter()
+                .map(|pkg| pkg.name.clone())
+                .collect();
+            assert!(
+                managed_wildcard_patterns_to_remove(&partial, &installed, &patterns).is_err(),
+                "selecting {selected_count} of four packages must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_unlock_rejects_mixed_selection() {
+        let installed = vec![
+            summary("linux-firmware-amdgpu"),
+            summary("linux-firmware-intel"),
+            summary("bash"),
+        ];
+        let patterns: HashSet<String> = ["linux-firmware*".to_string()].into_iter().collect();
+        let mixed = vec![
+            "linux-firmware-amdgpu".to_string(),
+            "linux-firmware-intel".to_string(),
+            "bash".to_string(),
+        ];
+
+        assert!(
+            managed_wildcard_patterns_to_remove(&mixed, &installed, &patterns).is_err()
+        );
+    }
+
+    #[test]
+    fn repository_usage_parser_defaults_to_all_and_accepts_restrictions() {
+        assert_eq!(parse_repo_usage(&[]).unwrap(), Usage::ALL);
+        assert_eq!(
+            parse_repo_usage(&["Sync Install".to_string()]).unwrap(),
+            Usage::SYNC | Usage::INSTALL
+        );
+    }
 }
