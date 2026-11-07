@@ -484,7 +484,7 @@ impl App {
         for pattern in &pacconf.no_extract { alpm.add_noextract(pattern.as_str())?; }
         for group in &pacconf.ignore_group { alpm.add_ignoregroup(group.as_str())?; }
 
-        let arch = pacconf.architecture.first().cloned().unwrap_or_else(|| "x86_64".to_string());
+        let arch = pacconf.architecture.first().filter(|arch| arch.as_str() != "auto").cloned().unwrap_or_else(|| std::env::consts::ARCH.to_string());
         for repo in &pacconf.repos {
             for server in &repo.servers {
                 let expanded = server.replace("$repo", &repo.name).replace("$arch", &arch);
@@ -2447,7 +2447,7 @@ mod tests {
     #[test]
     fn hold_package_patterns_support_globs() {
         assert!(wildcard_matches("linux*", "linux-lts"));
-        assert!(wildcard_matches("lib?alpm", "libalpm"));
+        assert!(wildcard_matches("lib?lpm", "libalpm"));
         assert!(!wildcard_matches("linux", "linux-lts"));
         assert!(is_hold_package("glibc", &["glib*".to_string()]));
     }
