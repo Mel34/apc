@@ -590,7 +590,11 @@ impl App {
             parse_external_ignore_packages(&pacconf.ignore_pkg, &locked_pkgs);
         // If a package is also excluded outside APC's managed file, external
         // configuration takes ownership and APC must not offer to unlock it.
-        locked_pkgs.retain(|pkg| !pacman_conf_ignored_pkgs.contains(pkg));
+        locked_pkgs.retain(|pkg| {
+            !pacman_conf_ignored_pkgs
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, pkg))
+        });
         for pkg in locked_pkgs.union(&pacman_conf_ignored_pkgs) {
             alpm.add_ignorepkg(pkg.as_str())?;
         }
@@ -687,7 +691,11 @@ impl App {
     }
 
     fn is_package_locked(&self, name: &str) -> bool {
-        self.locked_pkgs.contains(name) || self.pacman_conf_ignored_pkgs.contains(name)
+        self.locked_pkgs.contains(name)
+            || self
+                .pacman_conf_ignored_pkgs
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, name))
     }
 
     fn save_locked_packages(&self) -> Result<()> {
@@ -698,7 +706,12 @@ impl App {
         let mut list: Vec<&str> = self
             .locked_pkgs
             .iter()
-            .filter(|name| !self.pacman_conf_ignored_pkgs.contains(*name))
+            .filter(|name| {
+                !self
+                    .pacman_conf_ignored_pkgs
+                    .iter()
+                    .any(|pattern| wildcard_matches(pattern, name))
+            })
             .map(String::as_str)
             .collect();
         list.sort();
@@ -746,7 +759,11 @@ impl App {
 
         let externally_locked: Vec<&str> = targets
             .iter()
-            .filter(|target| self.pacman_conf_ignored_pkgs.contains(*target))
+            .filter(|target| {
+                self.pacman_conf_ignored_pkgs
+                    .iter()
+                    .any(|pattern| wildcard_matches(pattern, target))
+            })
             .map(String::as_str)
             .collect();
         if !externally_locked.is_empty() {
@@ -2668,13 +2685,15 @@ mod tests {
             .map(str::to_string)
             .collect();
 
+        let external = parse_external_ignore_packages(&configured, &managed);
         assert_eq!(
-            parse_external_ignore_packages(&configured, &managed),
+            external,
             ["linux", "linux-lts", "systemd"]
                 .into_iter()
                 .map(str::to_string)
                 .collect()
         );
+        assert!(external.iter().any(|pattern| wildcard_matches(pattern, "linux")));
     }
 
     #[test]
