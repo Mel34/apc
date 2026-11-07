@@ -985,6 +985,8 @@ impl App {
 
         // Refuse unresolved ALPM questions rather than silently approving package
         // replacement, conflict removal, ignored-package installation, or key import.
+        // Provider selection is also declined until APC has an interactive provider chooser,
+        // so transactions that require a choice stop safely.
         // The refusal is attached to the transaction error so the user sees why it stopped.
         alpm.set_question_cb((), |question, _| {
             let details = format!("{question:?}");
