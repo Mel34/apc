@@ -1,7 +1,7 @@
 use alpm::{Alpm, SigLevel, TransFlag, Usage};
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -112,7 +112,7 @@ impl PaneState {
             let f = self.filter.to_lowercase();
             self.all_items
                 .iter()
-                .filter(|p| p.name.to_lowercase().contains(&f))
+                .filter(|p| p.name.to_lowercase().contains(&f) || self.tagged.contains(&p.name))
                 .collect()
         }
     }
@@ -383,6 +383,38 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 
 fn is_hold_package(name: &str, hold_pkgs: &[String]) -> bool {
     hold_pkgs.iter().any(|pattern| wildcard_matches(pattern, name))
+}
+
+struct TerminalGuard {
+    tty: std::fs::File,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(&mut self.tty, LeaveAlternateScreen);
+    }
+}
+
+struct CommitGuard {
+    saved_stdout: libc::c_int,
+    saved_stderr: libc::c_int,
+}
+
+impl Drop for CommitGuard {
+    fn drop(&mut self) {
+        ACTIVE_TERM.with(|term| term.set(std::ptr::null_mut()));
+        BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = None);
+        if let Ok(mut state) = PACKAGE_PROGRESS.lock() {
+            *state = PackageProgressState::default();
+        }
+        if self.saved_stdout >= 0 {
+            unsafe { libc::dup2(self.saved_stdout, 1); libc::close(self.saved_stdout); }
+        }
+        if self.saved_stderr >= 0 {
+            unsafe { libc::dup2(self.saved_stderr, 2); libc::close(self.saved_stderr); }
+        }
+    }
 }
 
 struct App {
@@ -781,7 +813,10 @@ impl App {
             step: step.to_string(),
             percent,
         });
-        terminal.draw(|f| draw_ui(f, self))?;
+        terminal.draw(|f| {
+            draw_ui(f, self);
+            BACKGROUND_BUFFER.with(|buffer| *buffer.borrow_mut() = Some(f.buffer_mut().clone()));
+        })?;
         thread::sleep(Duration::from_millis(50));
         Ok(())
     }
@@ -795,35 +830,26 @@ impl App {
     where
         F: FnOnce() -> Result<R>,
     {
-        let null_fd = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY) };
         let saved_stdout = unsafe { libc::dup(1) };
         let saved_stderr = unsafe { libc::dup(2) };
-        if null_fd >= 0 {
-            unsafe {
-                libc::dup2(null_fd, 1);
-                libc::dup2(null_fd, 2);
-                libc::close(null_fd);
-            }
+        if saved_stdout < 0 || saved_stderr < 0 {
+            if saved_stdout >= 0 { unsafe { libc::close(saved_stdout); } }
+            if saved_stderr >= 0 { unsafe { libc::close(saved_stderr); } }
+            anyhow::bail!("Unable to preserve stdout/stderr for the package transaction");
         }
-
-        ACTIVE_TERM.with(|t| t.set(terminal as *mut _));
-
-
-        let result = action();
-
-        ACTIVE_TERM.with(|t| t.set(std::ptr::null_mut()));
-
-        if saved_stdout >= 0 {
-            unsafe {
-                libc::dup2(saved_stdout, 1);
-                libc::dup2(saved_stderr, 2);
-                libc::close(saved_stdout);
-                libc::close(saved_stderr);
-            }
+        let _guard = CommitGuard { saved_stdout, saved_stderr };
+        let null_fd = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY) };
+        if null_fd < 0 {
+            anyhow::bail!("Unable to open /dev/null for transaction output");
         }
-
-
-        result
+        let stdout_result = unsafe { libc::dup2(null_fd, 1) };
+        let stderr_result = unsafe { libc::dup2(null_fd, 2) };
+        unsafe { libc::close(null_fd); }
+        if stdout_result < 0 || stderr_result < 0 {
+            anyhow::bail!("Unable to redirect transaction output");
+        }
+        ACTIVE_TERM.with(|term| term.set(terminal as *mut _));
+        action()
     }
 
     // --- Finding Cached Versions for Downgrade ---
@@ -1057,8 +1083,13 @@ impl App {
     ) -> Result<()> {
         self.update_progress(terminal, "Syncing Databases", "Configured Mirrors", "Connecting to repository mirrors...", 20)?;
 
+        check_database_lock(&self.alpm)?;
         self.update_progress(terminal, "Syncing Databases", "Core, Extra, Multilib", "Downloading repository databases...", 50)?;
-        let _ = self.alpm.syncdbs_mut().update(false);
+        self.syncdbs_synced_without_upgrade = true;
+        if let Err(err) = self.alpm.syncdbs_mut().update(false) {
+            self.progress = None;
+            anyhow::bail!("Repository database synchronization failed: {err:?}");
+        }
 
         self.update_progress(terminal, "Syncing Databases", "Local Indices", "Refreshing package lists...", 85)?;
         self.refresh_available()?;
@@ -1078,7 +1109,11 @@ impl App {
         check_database_lock(&self.alpm)?;
 
         self.update_progress(terminal, "System Upgrade", "Repositories", "Synchronizing mirror databases...", 20)?;
-        let _ = self.alpm.syncdbs_mut().update(false);
+        self.syncdbs_synced_without_upgrade = true;
+        if let Err(err) = self.alpm.syncdbs_mut().update(false) {
+            self.progress = None;
+            anyhow::bail!("Repository database synchronization failed: {err:?}");
+        }
         self.refresh_available()?;
         self.refresh_installed()?;
 
@@ -1112,7 +1147,7 @@ impl App {
                 continue;
             }
 
-            let size = pkg.isize();
+            let size = pkg.download_size();
             total_download_size += size;
             let is_new = self.alpm.localdb().pkg(name.as_str()).is_err();
 
@@ -1132,6 +1167,7 @@ impl App {
         self.progress = None;
 
         if updates.is_empty() && new_deps.is_empty() {
+            self.syncdbs_synced_without_upgrade = false;
             let _ = self.alpm.trans_release();
             self.modal = Some(Modal::Message("Your system is already up to date! No updates available.".to_string()));
             return Ok(());
@@ -1175,6 +1211,7 @@ impl App {
         }
 
         self.alpm.trans_release()?;
+        self.syncdbs_synced_without_upgrade = false;
         self.refresh_installed()?;
         self.refresh_available()?;
         self.updates_view = None;
@@ -1205,7 +1242,7 @@ impl App {
                     name: pkg.name().to_string(),
                     version: pkg.version().as_str().to_string(),
                     desc: pkg.desc().unwrap_or("").to_string(),
-                    size: pkg.isize(),
+                    size: pkg.size(),
                 });
             }
         }
@@ -1674,8 +1711,8 @@ fn draw_dialog_box(f: &mut Frame, width: u16, height: u16) -> Rect {
     let y = (screen.height.saturating_sub(h)) / 2;
 
     let shadow_rect = Rect {
-        x: (x + 2).min(screen.width - 1),
-        y: (y + 1).min(screen.height - 1),
+        x: (x + 2).min(screen.width.saturating_sub(1)),
+        y: (y + 1).min(screen.height.saturating_sub(1)),
         width: w.min(screen.width.saturating_sub(x + 2)),
         height: h.min(screen.height.saturating_sub(y + 1)),
     };
@@ -1987,8 +2024,9 @@ fn main() -> Result<()> {
         .open("/dev/tty")?;
 
     enable_raw_mode()?;
-    let mut tty_clone = tty.try_clone()?;
-    execute!(tty_clone, EnterAlternateScreen)?;
+    let cleanup_tty = tty.try_clone()?;
+    let mut terminal_guard = TerminalGuard { tty: cleanup_tty };
+    execute!(&mut terminal_guard.tty, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(tty);
     let mut terminal = Terminal::new(backend)?;
 
@@ -2381,7 +2419,7 @@ fn main() -> Result<()> {
                 KeyCode::F(10) => {
                     app.should_quit = true;
                 }
-                KeyCode::Char(c) if c.is_alphanumeric() || matches!(c, '-' | '_' | '+' | '.' | '@' | ':') => {
+                KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && (c.is_alphanumeric() || matches!(c, '-' | '_' | '+' | '.' | '@' | ':')) => {
                     let cur = match app.active_pane {
                         ActivePane::Left => &mut app.left,
                         ActivePane::Right => &mut app.right,
@@ -2394,7 +2432,47 @@ fn main() -> Result<()> {
         }
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn summary(name: &str) -> PkgSummary {
+        PkgSummary { name: name.to_string(), version: "1-1".to_string(), desc: String::new(), size: 1 }
+    }
+    #[test]
+    fn tagged_packages_remain_visible_under_filter() {
+        let mut pane = PaneState::new(vec![summary("bash"), summary("linux"), summary("vim")]);
+        pane.tagged.insert("linux".to_string());
+        pane.filter = "vim".to_string();
+        let names: Vec<&str> = pane.filtered().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["linux", "vim"]);
+    }
+    #[test]
+    fn epoch_date_handles_unix_epoch_and_negative_days() {
+        assert_eq!(format_epoch_date(0), "1970-01-01");
+        assert_eq!(format_epoch_date(86_400), "1970-01-02");
+        assert_eq!(format_epoch_date(-86_400), "1969-12-31");
+    }
+    #[test]
+    fn hold_package_patterns_support_globs() {
+        assert!(wildcard_matches("linux*", "linux-lts"));
+        assert!(wildcard_matches("lib?alpm", "libalpm"));
+        assert!(!wildcard_matches("linux", "linux-lts"));
+        assert!(is_hold_package("glibc", &["glib*".to_string()]));
+    }
+    #[test]
+    fn siglevel_parser_preserves_global_defaults_and_applies_repo_overrides() {
+        let base = SigLevel::PACKAGE | SigLevel::DATABASE;
+        let parsed = parse_siglevel(&["DatabaseOptional".to_string()], base).unwrap();
+        assert!(parsed.contains(SigLevel::PACKAGE));
+        assert!(!parsed.contains(SigLevel::DATABASE));
+        assert!(parsed.contains(SigLevel::DATABASE_OPTIONAL));
+    }
+    #[test]
+    fn repository_usage_parser_defaults_to_all_and_accepts_restrictions() {
+        assert_eq!(parse_repo_usage(&[]).unwrap(), Usage::ALL);
+        assert_eq!(parse_repo_usage(&["Sync".to_string(), "Install".to_string()]).unwrap(), Usage::SYNC | Usage::INSTALL);
+    }
 }
