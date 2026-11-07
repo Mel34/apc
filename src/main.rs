@@ -1137,7 +1137,8 @@ impl App {
                 anyhow::bail!("Cannot queue '{name}' for removal: {message}");
             }
         }
-        let prepare_error = match self.alpm.trans_prepare() {
+        let prepare_result = self.alpm.trans_prepare().map_err(|err| format!("{err:?}"));
+        let prepare_error = match prepare_result {
             Ok(()) => take_question_refusal_details()
                 .map(|details| format!("Removal stopped: {details}")),
             Err(err) => {
@@ -1154,7 +1155,7 @@ impl App {
                         }
                     }
                 }
-                let mut message = format!("Safe removal was rejected by dependency checks: {err:?}");
+                let mut message = format!("Safe removal was rejected by dependency checks: {err}");
                 if !details.is_empty() {
                     message.push_str(&format!("\nInstalled dependents: {}", details.join("; ")));
                 }
@@ -1224,7 +1225,9 @@ impl App {
                 let pkg = self.alpm.syncdbs().iter()
                     .find_map(|db| db.pkg(name.as_str()).ok())
                     .ok_or_else(|| anyhow::anyhow!("Package not found in syncdbs: {name}"))?;
-                self.alpm.trans_add_pkg(pkg)?;
+                self.alpm.trans_add_pkg(pkg).map_err(|err| {
+                    anyhow::anyhow!("Failed to queue package '{name}': {err:?}")
+                })?;
             }
 
             self.alpm.trans_prepare()
