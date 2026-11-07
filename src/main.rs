@@ -438,7 +438,10 @@ struct App {
 
 impl App {
     fn mark_partial_upgrade_pending(&mut self) -> Result<()> {
-        fs::write(&self.partial_upgrade_marker, b"APC requires a full system upgrade after database synchronization.\n")?;
+        if let Err(err) = fs::write(&self.partial_upgrade_marker, b"APC requires a full system upgrade after database synchronization.\n") {
+            self.progress = None;
+            return Err(err.into());
+        }
         self.syncdbs_synced_without_upgrade = true;
         Ok(())
     }
@@ -1002,6 +1005,7 @@ impl App {
                 if let Ok(pkg) = db.pkg(name.as_str()) {
                     if let Err(err) = self.alpm.trans_add_pkg(pkg) {
                         let _ = self.alpm.trans_release();
+                        self.progress = None;
                         anyhow::bail!("Failed to add {name} to transaction: {err:?}");
                     }
                     found = true;
@@ -1010,6 +1014,7 @@ impl App {
             }
             if !found {
                 let _ = self.alpm.trans_release();
+                self.progress = None;
                 anyhow::bail!("Package not found in syncdbs: {name}");
             }
         }
