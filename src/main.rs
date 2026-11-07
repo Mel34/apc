@@ -604,6 +604,29 @@ fn parse_managed_ignore_pkg(content: &str) -> HashSet<String> {
     packages
 }
 
+fn updated_ignore_packages(
+    current: &[String],
+    previous_managed: &HashSet<String>,
+    next_managed: &HashSet<String>,
+    external: &HashSet<String>,
+) -> Vec<String> {
+    let mut updated: Vec<String> = current
+        .iter()
+        .filter(|package| !previous_managed.contains(*package))
+        .cloned()
+        .collect();
+
+    updated.extend(next_managed.iter().filter(|package| {
+        !external
+            .iter()
+            .any(|pattern| wildcard_matches(pattern, package))
+    }).cloned());
+
+    updated.sort();
+    updated.dedup();
+    updated
+}
+
 fn atomic_replace_file(path: &Path, content: &[u8]) -> Result<()> {
     // Resolve an existing symlink so replacing the file does not replace the
     // symlink itself and break pacman.conf's Include chain.
@@ -1045,9 +1068,8 @@ impl App {
             || package_matches_patterns(name, &self.pacman_conf_ignored_pkgs)
     }
 
-    fn save_locked_packages(&self) -> Result<()> {
-        let mut list: Vec<&str> = self
-            .locked_pkgs
+    fn save_locked_packages(&self, locked_pkgs: &HashSet<String>) -> Result<()> {
+        let mut list: Vec<&str> = locked_pkgs
             .iter()
             .filter(|name| {
                 !self
@@ -1101,89 +1123,76 @@ impl App {
             &self.left.all_items,
             &self.locked_pkgs,
         )?;
-        if !wildcard_patterns_to_remove.is_empty() {
-            let previous_locked = self.locked_pkgs.clone();
-            let mut removed_patterns: Vec<String> = Vec::new();
-
-            for pattern in &wildcard_patterns_to_remove {
-                if let Err(err) = self.alpm.remove_ignorepkg(pattern.as_str()).map(|_| ()) {
-                    for removed in &removed_patterns {
-                        let _ = self.alpm.add_ignorepkg(removed.as_str());
-                    }
-                    return Err(err.into());
-                }
-                removed_patterns.push(pattern.clone());
-            }
-
-            for pattern in &wildcard_patterns_to_remove {
-                self.locked_pkgs.remove(pattern);
-            }
-
-            if let Err(err) = self.save_locked_packages() {
-                for pattern in &removed_patterns {
-                    let _ = self.alpm.add_ignorepkg(pattern.as_str());
-                }
-                self.locked_pkgs = previous_locked;
-                return Err(err);
-            }
-
-            self.left.tagged.clear();
-            return Ok(());
-        }
-
-        let managed_wildcard_locked: Vec<&str> = targets
-            .iter()
-            .filter(|target| is_managed_wildcard_lock(target, &self.locked_pkgs))
-            .map(String::as_str)
-            .collect();
-        if !managed_wildcard_locked.is_empty() {
-            anyhow::bail!(
-                "Cannot change {}: covered by an APC-managed wildcard in {}; edit that pattern to change the lock",
-                managed_wildcard_locked.join(", "),
-                IGNORE_PKG_FILE
-            );
-        }
-
         let previous_locked = self.locked_pkgs.clone();
-        let any_unlocked = targets.iter().any(|t| !previous_locked.contains(t));
+        let mut next_locked = previous_locked.clone();
 
-        for t in &targets {
-            let result = if any_unlocked {
-                self.alpm.add_ignorepkg(t.as_str())
-            } else {
-                self.alpm.remove_ignorepkg(t.as_str()).map(|_| ())
-            };
-            if let Err(err) = result {
-                for target in &targets {
-                    if previous_locked.contains(target) {
-                        let _ = self.alpm.add_ignorepkg(target.as_str());
-                    } else {
-                        let _ = self.alpm.remove_ignorepkg(target.as_str());
-                    }
-                }
-                self.locked_pkgs = previous_locked;
-                return Err(err.into());
+        if !wildcard_patterns_to_remove.is_empty() {
+            for pattern in &wildcard_patterns_to_remove {
+                next_locked.remove(pattern);
+            }
+        } else {
+            let managed_wildcard_locked: Vec<&str> = targets
+                .iter()
+                .filter(|target| is_managed_wildcard_lock(target, &self.locked_pkgs))
+                .map(String::as_str)
+                .collect();
+            if !managed_wildcard_locked.is_empty() {
+                anyhow::bail!(
+                    "Cannot change {}: covered by an APC-managed wildcard in {}; edit that pattern to change the lock",
+                    managed_wildcard_locked.join(", "),
+                    IGNORE_PKG_FILE
+                );
             }
 
-            if any_unlocked {
-                self.locked_pkgs.insert(t.clone());
-            } else {
-                self.locked_pkgs.remove(t);
-            }
-        }
-
-        if let Err(err) = self.save_locked_packages() {
+            let any_unlocked = targets.iter().any(|target| !previous_locked.contains(target));
             for target in &targets {
-                if previous_locked.contains(target) {
-                    let _ = self.alpm.add_ignorepkg(target.as_str());
+                if any_unlocked {
+                    next_locked.insert(target.clone());
                 } else {
-                    let _ = self.alpm.remove_ignorepkg(target.as_str());
+                    next_locked.remove(target);
                 }
             }
-            self.locked_pkgs = previous_locked;
-            return Err(err);
         }
 
+        let previous_ignorepkgs: Vec<String> = self
+            .alpm
+            .ignorepkgs()
+            .iter()
+            .map(str::to_string)
+            .collect();
+        let next_ignorepkgs = updated_ignore_packages(
+            &previous_ignorepkgs,
+            &previous_locked,
+            &next_locked,
+            &self.pacman_conf_ignored_pkgs,
+        );
+
+        // Persist the complete new managed set before changing the live ALPM handle.
+        self.save_locked_packages(&next_locked)?;
+
+        let next_ignorepkg_refs: Vec<&str> =
+            next_ignorepkgs.iter().map(String::as_str).collect();
+        if let Err(err) = self.alpm.set_ignorepkgs(next_ignorepkg_refs.iter()) {
+            let file_rollback = self.save_locked_packages(&previous_locked);
+            let previous_ignorepkg_refs: Vec<&str> =
+                previous_ignorepkgs.iter().map(String::as_str).collect();
+            let alpm_rollback = self.alpm.set_ignorepkgs(previous_ignorepkg_refs.iter());
+
+            let mut message = format!("Failed to update libalpm's IgnorePkg list: {err}");
+            if let Err(rollback_err) = file_rollback {
+                message.push_str(&format!(
+                    "\nFailed to restore the previous managed IgnorePkg file: {rollback_err}"
+                ));
+            }
+            if let Err(rollback_err) = alpm_rollback {
+                message.push_str(&format!(
+                    "\nFailed to restore libalpm's previous IgnorePkg list: {rollback_err}"
+                ));
+            }
+            anyhow::bail!("{message}");
+        }
+
+        self.locked_pkgs = next_locked;
         self.left.tagged.clear();
         Ok(())
     }
@@ -3262,6 +3271,29 @@ mod tests {
         ));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn updating_ignore_packages_preserves_external_entries_and_replaces_managed_entries() {
+        let current = vec![
+            "external-*".to_string(),
+            "old-managed".to_string(),
+            "keep-managed".to_string(),
+        ];
+        let previous_managed: HashSet<String> = ["old-managed", "keep-managed"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let next_managed: HashSet<String> = ["new-managed", "external-covered"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let external: HashSet<String> = ["external-*".to_string()].into_iter().collect();
+
+        assert_eq!(
+            updated_ignore_packages(&current, &previous_managed, &next_managed, &external),
+            vec!["external-*".to_string(), "new-managed".to_string()]
+        );
     }
 
     #[test]
