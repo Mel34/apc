@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install toolchain and native dependencies
+        run: pacman -Syu --noconfirm --needed base-devel git nodejs rust
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --locked
