@@ -3559,6 +3559,135 @@ mod tests {
     }
 
     #[test]
+    fn ignorepkg_state_does_not_touch_alpm_when_initial_persistence_fails() {
+        use std::cell::Cell;
+
+        let previous_managed: HashSet<String> = ["old-lock"].into_iter().map(str::to_string).collect();
+        let next_managed: HashSet<String> = ["new-lock"].into_iter().map(str::to_string).collect();
+        let apply_calls = Cell::new(0);
+
+        let result = update_ignorepkg_state(
+            &previous_managed,
+            &next_managed,
+            &["old-lock".to_string()],
+            &["new-lock".to_string()],
+            |_| anyhow::bail!("injected initial persistence failure"),
+            |_| {
+                apply_calls.set(apply_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(result.unwrap_err().to_string().contains("injected initial persistence failure"));
+        assert_eq!(apply_calls.get(), 0);
+    }
+
+    #[test]
+    fn ignorepkg_state_restores_file_and_alpm_after_apply_failure() {
+        use std::cell::RefCell;
+
+        let previous_managed: HashSet<String> = ["old-lock"].into_iter().map(str::to_string).collect();
+        let next_managed: HashSet<String> = ["new-lock"].into_iter().map(str::to_string).collect();
+        let persisted = RefCell::new(previous_managed.clone());
+        let live = RefCell::new(vec!["old-lock".to_string()]);
+
+        let result = update_ignorepkg_state(
+            &previous_managed,
+            &next_managed,
+            &["old-lock".to_string()],
+            &["new-lock".to_string()],
+            |locked| {
+                *persisted.borrow_mut() = locked.clone();
+                Ok(())
+            },
+            |packages| {
+                if packages == ["new-lock"] {
+                    anyhow::bail!("injected ALPM update failure");
+                }
+                *live.borrow_mut() = packages.to_vec();
+                Ok(())
+            },
+        );
+
+        assert!(result.unwrap_err().to_string().contains("injected ALPM update failure"));
+        assert_eq!(*persisted.borrow(), previous_managed);
+        assert_eq!(*live.borrow(), vec!["old-lock".to_string()]);
+    }
+
+    #[test]
+    fn ignorepkg_state_reports_file_rollback_failure() {
+        use std::cell::{Cell, RefCell};
+
+        let previous_managed: HashSet<String> = ["old-lock"].into_iter().map(str::to_string).collect();
+        let next_managed: HashSet<String> = ["new-lock"].into_iter().map(str::to_string).collect();
+        let persisted = RefCell::new(previous_managed.clone());
+        let persist_calls = Cell::new(0);
+        let live = RefCell::new(vec!["old-lock".to_string()]);
+
+        let result = update_ignorepkg_state(
+            &previous_managed,
+            &next_managed,
+            &["old-lock".to_string()],
+            &["new-lock".to_string()],
+            |locked| {
+                let call = persist_calls.get() + 1;
+                persist_calls.set(call);
+                if call == 2 {
+                    anyhow::bail!("injected file rollback failure");
+                }
+                *persisted.borrow_mut() = locked.clone();
+                Ok(())
+            },
+            |packages| {
+                if packages == ["new-lock"] {
+                    anyhow::bail!("injected ALPM update failure");
+                }
+                *live.borrow_mut() = packages.to_vec();
+                Ok(())
+            },
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("injected ALPM update failure"));
+        assert!(error.contains("Failed to restore the previous managed IgnorePkg file"));
+        assert!(error.contains("injected file rollback failure"));
+        assert_eq!(*persisted.borrow(), next_managed);
+        assert_eq!(*live.borrow(), vec!["old-lock".to_string()]);
+    }
+
+    #[test]
+    fn ignorepkg_state_reports_alpm_rollback_failure() {
+        use std::cell::RefCell;
+
+        let previous_managed: HashSet<String> = ["old-lock"].into_iter().map(str::to_string).collect();
+        let next_managed: HashSet<String> = ["new-lock"].into_iter().map(str::to_string).collect();
+        let persisted = RefCell::new(previous_managed.clone());
+
+        let result = update_ignorepkg_state(
+            &previous_managed,
+            &next_managed,
+            &["old-lock".to_string()],
+            &["new-lock".to_string()],
+            |locked| {
+                *persisted.borrow_mut() = locked.clone();
+                Ok(())
+            },
+            |packages| {
+                if packages == ["new-lock"] {
+                    anyhow::bail!("injected ALPM update failure");
+                }
+                anyhow::bail!("injected ALPM rollback failure");
+            },
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("injected ALPM update failure"));
+        assert!(error.contains("Failed to restore libalpm's previous IgnorePkg list"));
+        assert!(error.contains("injected ALPM rollback failure"));
+        assert_eq!(*persisted.borrow(), previous_managed);
+    }
+
+    #[test]
     fn atomic_file_replacement_replaces_contents_and_preserves_mode() {
         use std::os::unix::fs::PermissionsExt;
 
