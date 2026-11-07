@@ -2077,14 +2077,14 @@ fn main() -> Result<()> {
             .arg(current_exe)
             .args(&args)
             .status()?;
-        std::process::exit(status.code().unwrap_or(0));
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     let mut app = match App::new() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("Failed to initialize ALPM: {e}");
-            return Ok(());
+            return Err(e);
         }
     };
 
