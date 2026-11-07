@@ -317,7 +317,7 @@ fn parse_siglevel(tokens: &[String], mut level: SigLevel) -> Result<SigLevel> {
         };
         match requirement {
             "required" => { level.insert(required); level.remove(optional); }
-            "optional" => { level.insert(required | optional); }
+            "optional" => { level.remove(required); level.insert(optional); }
             "never" => { level.remove(required | optional); }
             _ => {}
         }
@@ -3233,7 +3233,8 @@ mod tests {
         let base = SigLevel::PACKAGE | SigLevel::DATABASE;
         let parsed = parse_siglevel(&["DatabaseOptional".to_string()], base).unwrap();
         assert!(parsed.contains(SigLevel::PACKAGE));
-        assert!(parsed.contains(SigLevel::DATABASE));
+        assert!(!parsed.contains(SigLevel::PACKAGE_OPTIONAL));
+        assert!(!parsed.contains(SigLevel::DATABASE));
         assert!(parsed.contains(SigLevel::DATABASE_OPTIONAL));
 
         let combined = parse_siglevel(
@@ -3241,13 +3242,37 @@ mod tests {
             SigLevel::NONE,
         ).unwrap();
         assert!(combined.contains(SigLevel::PACKAGE));
-        assert!(combined.contains(SigLevel::DATABASE));
+        assert!(!combined.contains(SigLevel::PACKAGE_OPTIONAL));
+        assert!(!combined.contains(SigLevel::DATABASE));
         assert!(combined.contains(SigLevel::DATABASE_OPTIONAL));
 
         let package_optional =
             parse_siglevel(&["PackageOptional".to_string()], SigLevel::NONE).unwrap();
-        assert!(package_optional.contains(SigLevel::PACKAGE));
+        assert!(!package_optional.contains(SigLevel::PACKAGE));
         assert!(package_optional.contains(SigLevel::PACKAGE_OPTIONAL));
+        assert!(!package_optional.contains(SigLevel::DATABASE));
+        assert!(!package_optional.contains(SigLevel::DATABASE_OPTIONAL));
+
+        let global_optional =
+            parse_siglevel(&["Optional".to_string()], SigLevel::PACKAGE | SigLevel::DATABASE).unwrap();
+        assert!(!global_optional.contains(SigLevel::PACKAGE));
+        assert!(global_optional.contains(SigLevel::PACKAGE_OPTIONAL));
+        assert!(!global_optional.contains(SigLevel::DATABASE));
+        assert!(global_optional.contains(SigLevel::DATABASE_OPTIONAL));
+
+        let required_after_optional = parse_siglevel(
+            &["PackageOptional PackageRequired".to_string()],
+            SigLevel::NONE,
+        ).unwrap();
+        assert!(required_after_optional.contains(SigLevel::PACKAGE));
+        assert!(!required_after_optional.contains(SigLevel::PACKAGE_OPTIONAL));
+
+        let optional_after_required = parse_siglevel(
+            &["PackageRequired PackageOptional".to_string()],
+            SigLevel::NONE,
+        ).unwrap();
+        assert!(!optional_after_required.contains(SigLevel::PACKAGE));
+        assert!(optional_after_required.contains(SigLevel::PACKAGE_OPTIONAL));
 
         let never = parse_siglevel(&["Never".to_string()], SigLevel::PACKAGE | SigLevel::DATABASE).unwrap();
         assert!(!never.contains(SigLevel::PACKAGE));
