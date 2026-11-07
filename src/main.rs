@@ -703,19 +703,46 @@ impl App {
             return Ok(());
         };
 
-        let any_unlocked = targets.iter().any(|t| !self.locked_pkgs.contains(t));
+        let previous_locked = self.locked_pkgs.clone();
+        let any_unlocked = targets.iter().any(|t| !previous_locked.contains(t));
 
         for t in &targets {
+            let result = if any_unlocked {
+                self.alpm.add_ignorepkg(t.as_str())
+            } else {
+                self.alpm.remove_ignorepkg(t.as_str())
+            };
+            if let Err(err) = result {
+                for target in &targets {
+                    if previous_locked.contains(target) {
+                        let _ = self.alpm.add_ignorepkg(target.as_str());
+                    } else {
+                        let _ = self.alpm.remove_ignorepkg(target.as_str());
+                    }
+                }
+                self.locked_pkgs = previous_locked;
+                return Err(err.into());
+            }
+
             if any_unlocked {
                 self.locked_pkgs.insert(t.clone());
-                let _ = self.alpm.add_ignorepkg(t.as_str());
             } else {
                 self.locked_pkgs.remove(t);
-                let _ = self.alpm.remove_ignorepkg(t.as_str());
             }
         }
 
-        self.save_locked_packages()?;
+        if let Err(err) = self.save_locked_packages() {
+            for target in &targets {
+                if previous_locked.contains(target) {
+                    let _ = self.alpm.add_ignorepkg(target.as_str());
+                } else {
+                    let _ = self.alpm.remove_ignorepkg(target.as_str());
+                }
+            }
+            self.locked_pkgs = previous_locked;
+            return Err(err);
+        }
+
         self.left.tagged.clear();
         Ok(())
     }
