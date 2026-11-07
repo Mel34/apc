@@ -974,8 +974,11 @@ impl App {
         let pkg_name = pkg.name().to_string();
 
         self.alpm.trans_init(TransFlag::empty())?;
-        if let Err(err) = self.alpm.trans_add_pkg(pkg) {
-            let message = format!("{err:?}");
+        let add_error = match self.alpm.trans_add_pkg(pkg) {
+            Ok(()) => None,
+            Err(err) => Some(format!("{err:?}")),
+        };
+        if let Some(message) = add_error {
             let _ = self.alpm.trans_release();
             anyhow::bail!("Failed to queue package for downgrade: {message}");
         }
